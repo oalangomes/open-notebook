@@ -3,6 +3,11 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 from surreal_commands import get_command_status, submit_command
 
+from open_notebook.database.repository import ensure_record_id, repo_query, repo_update
+from open_notebook.exceptions import InvalidInputError, NotFoundError
+
+
+SOURCE_QUEUE_FETCH_LIMIT_CAP = 500
 
 class CommandService:
     """Generic service layer for command operations"""
@@ -73,19 +78,112 @@ class CommandService:
         command_filter: Optional[str] = None,
         status_filter: Optional[str] = None,
         limit: int = 50,
+        source_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """List command jobs with optional filtering"""
-        # This will be implemented with proper SurrealDB queries
-        # For now, return empty list as this is foundation phase
-        return []
+        try:
+            safe_limit = max(1, min(limit, SOURCE_QUEUE_FETCH_LIMIT_CAP))
+
+            command_fetch_limit = safe_limit
+            if source_only:
+                command_fetch_limit = min(
+                    max(safe_limit * 10, 200), SOURCE_QUEUE_FETCH_LIMIT_CAP
+                )
+
+            commands = await repo_query(
+                "SELECT * FROM command ORDER BY created DESC LIMIT $limit",
+                {"limit": command_fetch_limit},
+            )
+
+            source_map: Dict[str, Dict[str, Any]] = {}
+            if source_only:
+                sources = await repo_query(
+                    "SELECT id, title, asset, command FROM source WHERE command != NONE"
+                )
+                source_map = {
+                    str(source["command"]): source
+                    for source in sources
+                    if source.get("command")
+                }
+
+            jobs: List[Dict[str, Any]] = []
+            for command in commands:
+                if module_filter and command.get("app") != module_filter:
+                    continue
+                if command_filter and command.get("name") != command_filter:
+                    continue
+                if status_filter and command.get("status") != status_filter:
+                    continue
+
+                job_id = str(command.get("id"))
+                source = source_map.get(job_id)
+                if source_only and source is None:
+                    continue
+
+                asset = source.get("asset") if source else None
+                jobs.append(
+                    {
+                        "job_id": job_id,
+                        "app": command.get("app"),
+                        "command": command.get("name"),
+                        "status": command.get("status", "unknown"),
+                        "result": command.get("result"),
+                        "error_message": command.get("error_message"),
+                        "created": str(command.get("created"))
+                        if command.get("created")
+                        else None,
+                        "updated": str(command.get("updated"))
+                        if command.get("updated")
+                        else None,
+                        "progress": command.get("progress"),
+                        "source_id": source.get("id") if source else None,
+                        "source_title": source.get("title") if source else None,
+                        "source_path": asset.get("file_path")
+                        if isinstance(asset, dict)
+                        else None,
+                        "source_url": asset.get("url")
+                        if isinstance(asset, dict)
+                        else None,
+                        "can_cancel": command.get("status") == "new",
+                    }
+                )
+
+                if len(jobs) >= safe_limit:
+                    break
+
+            return jobs
+        except Exception as e:
+            logger.error(f"Failed to list command jobs: {e}")
+            raise
 
     @staticmethod
     async def cancel_command_job(job_id: str) -> bool:
         """Cancel a running command job"""
         try:
-            # Implementation depends on surreal-commands cancellation support
-            # For now, just log the attempt
-            logger.info(f"Attempting to cancel job: {job_id}")
+            command = await repo_query(
+                "SELECT * FROM $id", {"id": ensure_record_id(job_id)}
+            )
+            if not command:
+                raise NotFoundError(f"Command job {job_id} not found")
+
+            status = command[0].get("status")
+            if status == "canceled":
+                return True
+            if status != "new":
+                raise InvalidInputError(
+                    "Only queued source jobs can be cancelled before execution starts"
+                )
+
+            await repo_update(
+                "command",
+                job_id,
+                {
+                    "status": "canceled",
+                    "error_message": "Cancelled by user before execution",
+                },
+            )
+
+            logger.info(f"Cancelled queued job: {job_id}")
             return True
         except Exception as e:
             logger.error(f"Failed to cancel command job: {e}")

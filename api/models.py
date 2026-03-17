@@ -256,6 +256,29 @@ class RebuildStatusResponse(BaseModel):
     error_message: Optional[str] = None
 
 
+class CommandJobListItemResponse(BaseModel):
+    job_id: str
+    app: Optional[str] = None
+    command: Optional[str] = None
+    status: str
+    result: Optional[Dict[str, Any]] = None
+    error_message: Optional[str] = None
+    created: Optional[str] = None
+    updated: Optional[str] = None
+    progress: Optional[Dict[str, Any]] = None
+    source_id: Optional[str] = None
+    source_title: Optional[str] = None
+    source_path: Optional[str] = None
+    source_url: Optional[str] = None
+    can_cancel: bool = False
+
+
+class CommandCancellationResponse(BaseModel):
+    job_id: str
+    cancelled: bool
+    status: str
+
+
 # Settings API models
 class SettingsResponse(BaseModel):
     default_content_processing_engine_doc: Optional[str] = None

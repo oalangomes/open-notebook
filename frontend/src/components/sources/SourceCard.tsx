@@ -91,13 +91,21 @@ const getStatusConfig = (t: TranslationKeys) => ({
     borderColor: 'border-red-200',
     label: t.sources.statusFailed,
     description: t.sources.statusFailedDesc
+  },
+  canceled: {
+    icon: AlertTriangle,
+    color: 'text-zinc-600',
+    bgColor: 'bg-zinc-100',
+    borderColor: 'border-zinc-300',
+    label: t.sources.statusCanceled,
+    description: t.sources.statusCanceledDesc
   }
 } as const)
 
-type SourceStatus = 'new' | 'queued' | 'running' | 'completed' | 'failed'
+type SourceStatus = 'new' | 'queued' | 'running' | 'completed' | 'failed' | 'canceled'
 
 function isSourceStatus(status: unknown): status is SourceStatus {
-  return typeof status === 'string' && ['new', 'queued', 'running', 'completed', 'failed'].includes(status)
+  return typeof status === 'string' && ['new', 'queued', 'running', 'completed', 'failed', 'canceled'].includes(status)
 }
 
 function getSourceType(source: SourceListResponse): 'link' | 'upload' | 'text' {
@@ -158,7 +166,7 @@ export function SourceCard({
 
     // If we were processing and now completed/failed, trigger refresh and stop polling
     if (wasProcessing &&
-        (currentStatusFromData === 'completed' || currentStatusFromData === 'failed')) {
+        (currentStatusFromData === 'completed' || currentStatusFromData === 'failed' || currentStatusFromData === 'canceled')) {
       setWasProcessing(false) // Stop polling
 
       if (onRefresh) {
@@ -200,6 +208,7 @@ export function SourceCard({
 
   const isProcessing: boolean = currentStatus === 'new' || currentStatus === 'running' || currentStatus === 'queued'
   const isFailed: boolean = currentStatus === 'failed'
+  const isCanceled: boolean = currentStatus === 'canceled'
   const isCompleted: boolean = currentStatus === 'completed'
 
   return (
@@ -248,7 +257,7 @@ export function SourceCard({
             </div>
 
             {/* Processing message for active statuses */}
-            {statusData?.message && (isProcessing || isFailed) && (
+            {statusData?.message && (isProcessing || isFailed || isCanceled) && (
               <p className="text-xs text-gray-600 mb-2 italic">
                 {statusData.message}
               </p>

@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 from surreal_commands import registry
 
 from api.command_service import CommandService
+from api.models import CommandCancellationResponse, CommandJobListItemResponse
+from open_notebook.exceptions import InvalidInputError, NotFoundError
 
 router = APIRouter()
 
@@ -85,16 +87,22 @@ async def get_command_job_status(job_id: str):
         )
 
 
-@router.get("/commands/jobs", response_model=List[Dict[str, Any]])
+@router.get("/commands/jobs", response_model=List[CommandJobListItemResponse])
 async def list_command_jobs(
     command_filter: Optional[str] = Query(None, description="Filter by command name"),
     status_filter: Optional[str] = Query(None, description="Filter by status"),
+    source_only: bool = Query(
+        False, description="Return only jobs associated with source processing"
+    ),
     limit: int = Query(50, description="Maximum number of jobs to return"),
 ):
     """List command jobs with optional filtering"""
     try:
         jobs = await CommandService.list_command_jobs(
-            command_filter=command_filter, status_filter=status_filter, limit=limit
+            command_filter=command_filter,
+            status_filter=status_filter,
+            limit=limit,
+            source_only=source_only,
         )
         return jobs
 
@@ -105,12 +113,22 @@ async def list_command_jobs(
         )
 
 
-@router.delete("/commands/jobs/{job_id}")
+@router.delete(
+    "/commands/jobs/{job_id}", response_model=CommandCancellationResponse
+)
 async def cancel_command_job(job_id: str):
     """Cancel a running command job"""
     try:
         success = await CommandService.cancel_command_job(job_id)
-        return {"job_id": job_id, "cancelled": success}
+        return CommandCancellationResponse(
+            job_id=job_id,
+            cancelled=success,
+            status="canceled" if success else "unknown",
+        )
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except InvalidInputError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     except Exception as e:
         logger.error(f"Error cancelling command job: {str(e)}")

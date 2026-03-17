@@ -231,7 +231,7 @@ export function useSourceStatus(sourceId: string, enabled = true) {
       if (data?.status === 'running' || data?.status === 'queued' || data?.status === 'new') {
         return 2000
       }
-      // No auto-refresh if completed, failed, or unknown
+      // No auto-refresh if completed, failed, canceled, or unknown
       return false
     },
     staleTime: 0, // Always consider status data stale for real-time updates

@@ -718,6 +718,8 @@ async def get_source_status(source_id: str):
                 message = "Source processing completed successfully"
             elif status == "failed":
                 message = "Source processing failed"
+            elif status == "canceled":
+                message = "Source processing was cancelled"
             elif status == "running":
                 message = "Source processing in progress"
             elif status == "queued":
