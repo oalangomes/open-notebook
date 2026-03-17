@@ -1,0 +1,3 @@
+-- Rollback Migration 15: Make credential_id mandatory again
+
+DEFINE FIELD credential_id ON git_sync TYPE string;

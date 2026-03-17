@@ -1,0 +1,5 @@
+-- Rollback Migration 16: Remove markdown discovery settings from git sync
+
+REMOVE FIELD max_discovery_files ON git_sync;
+REMOVE FIELD max_discovery_depth ON git_sync;
+REMOVE FIELD seed_paths ON git_sync;

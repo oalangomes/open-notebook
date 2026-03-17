@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from surreal_commands import CommandInput, CommandOutput, command
 
 from open_notebook.database.repository import ensure_record_id
-from open_notebook.domain.notebook import Source
+from open_notebook.domain.notebook import Asset, Source
 from open_notebook.domain.transformation import Transformation
 from open_notebook.exceptions import ConfigurationError
 
@@ -101,18 +101,47 @@ async def process_source_command(
         # 3. Process source with all notebooks
         logger.info(f"Processing source with {len(input_data.notebook_ids)} notebooks")
 
-        # Execute source_graph with all notebooks
-        result = await source_graph.ainvoke(
-            {  # type: ignore[arg-type]
-                "content_state": input_data.content_state,
-                "notebook_ids": input_data.notebook_ids,  # Use notebook_ids (plural) as expected by SourceState
-                "apply_transformations": transformations,
-                "embed": input_data.embed,
-                "source_id": input_data.source_id,  # Add the source_id to the state
-            }
-        )
+        pre_extracted_content = input_data.content_state.get("content")
+        if isinstance(pre_extracted_content, str) and pre_extracted_content.strip():
+            logger.info(
+                f"Using pre-extracted content for source {input_data.source_id}; "
+                "skipping remote fetch/extraction"
+            )
+            source.asset = Asset(
+                url=input_data.content_state.get("url"),
+                file_path=input_data.content_state.get("file_path"),
+            )
+            source.full_text = pre_extracted_content
+            if input_data.content_state.get("title"):
+                source.title = input_data.content_state["title"]
+            await source.save()
 
-        processed_source = result["source"]
+            if input_data.embed and source.full_text.strip():
+                await source.vectorize()
+
+            for transformation in transformations:
+                await transform_graph.ainvoke(
+                    {
+                        "source": source,
+                        "transformation": transformation,
+                        "input_text": source.full_text,
+                    }
+                )
+
+            processed_source = source
+        else:
+            # Execute source_graph with all notebooks
+            result = await source_graph.ainvoke(
+                {  # type: ignore[arg-type]
+                    "content_state": input_data.content_state,
+                    "notebook_ids": input_data.notebook_ids,  # Use notebook_ids (plural) as expected by SourceState
+                    "apply_transformations": transformations,
+                    "embed": input_data.embed,
+                    "source_id": input_data.source_id,  # Add the source_id to the state
+                }
+            )
+
+            processed_source = result["source"]
 
         # 4. Gather processing results (notebook associations handled by source_graph)
         # Note: embedding is fire-and-forget (async job), so we can't query the

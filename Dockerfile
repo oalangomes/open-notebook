@@ -92,7 +92,7 @@ RUN mkdir -p /app/data
 
 # Copy and make executable the wait-for-api script
 COPY scripts/wait-for-api.sh /app/scripts/wait-for-api.sh
-RUN chmod +x /app/scripts/wait-for-api.sh
+RUN sed -i 's/\r$//' /app/scripts/wait-for-api.sh && chmod +x /app/scripts/wait-for-api.sh
 
 # Copy supervisord configuration
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf

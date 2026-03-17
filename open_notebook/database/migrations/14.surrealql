@@ -1,0 +1,25 @@
+-- Migration 14: Add Git RAW sync configuration/state for private markdown repos
+
+DEFINE TABLE git_sync SCHEMAFULL;
+DEFINE FIELD provider ON git_sync TYPE string;
+DEFINE FIELD repo ON git_sync TYPE string;
+DEFINE FIELD branch ON git_sync TYPE string;
+DEFINE FIELD paths ON git_sync TYPE array DEFAULT [];
+DEFINE FIELD paths.* ON git_sync TYPE string;
+DEFINE FIELD credential_id ON git_sync TYPE string;
+DEFINE FIELD notebooks ON git_sync TYPE array DEFAULT [];
+DEFINE FIELD notebooks.* ON git_sync TYPE string;
+DEFINE FIELD transformations ON git_sync TYPE array DEFAULT [];
+DEFINE FIELD transformations.* ON git_sync TYPE string;
+DEFINE FIELD embed ON git_sync TYPE bool DEFAULT false;
+DEFINE FIELD refresh_interval ON git_sync TYPE option<string>;
+DEFINE FIELD file_states ON git_sync TYPE array DEFAULT [];
+DEFINE FIELD file_states.* ON git_sync TYPE object;
+DEFINE FIELD last_sync ON git_sync TYPE option<datetime>;
+DEFINE FIELD last_status ON git_sync TYPE option<string>;
+DEFINE FIELD last_error ON git_sync TYPE option<string>;
+DEFINE FIELD last_run_summary ON git_sync TYPE option<object>;
+DEFINE FIELD created ON git_sync TYPE option<datetime> DEFAULT time::now();
+DEFINE FIELD updated ON git_sync TYPE option<datetime> DEFAULT time::now();
+
+DEFINE INDEX idx_git_sync_provider_repo_branch ON git_sync FIELDS provider, repo, branch;

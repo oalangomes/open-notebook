@@ -21,18 +21,29 @@ import { ProcessingStep } from './steps/ProcessingStep'
 import { useNotebooks } from '@/lib/hooks/use-notebooks'
 import { useTransformations } from '@/lib/hooks/use-transformations'
 import { useCreateSource } from '@/lib/hooks/use-sources'
+import { useCreateGitSyncSource } from '@/lib/hooks/use-git-syncs'
 import { useSettings } from '@/lib/hooks/use-settings'
 import { CreateSourceRequest } from '@/lib/types/api'
 import { useTranslation } from '@/lib/hooks/use-translation'
+import { useCreateCredential, useCredentialsByProvider } from '@/lib/hooks/use-credentials'
 
 const MAX_BATCH_SIZE = 50
 
 const createSourceSchema = z.object({
-  type: z.enum(['link', 'upload', 'text']),
+  type: z.enum(['link', 'upload', 'text', 'git']),
   title: z.string().optional(),
   url: z.string().optional(),
   content: z.string().optional(),
   file: z.any().optional(),
+  git_provider: z.enum(['azure_devops', 'github']).optional(),
+  git_public: z.boolean().optional(),
+  git_repo: z.string().optional(),
+  git_branch: z.string().optional(),
+  git_paths: z.string().optional(),
+  git_seed_paths: z.string().optional(),
+  git_max_discovery_depth: z.number().int().min(0).max(10).optional(),
+  git_max_discovery_files: z.number().int().min(1).max(5000).optional(),
+  git_credential_id: z.string().optional(),
   notebooks: z.array(z.string()).optional(),
   transformations: z.array(z.string()).optional(),
   embed: z.boolean(),
@@ -49,6 +60,16 @@ const createSourceSchema = z.object({
       return data.file.length > 0
     }
     return !!data.file
+  }
+  if (data.type === 'git') {
+    return !!data.git_repo?.trim()
+      && !!data.git_branch?.trim()
+      && (!!data.git_paths?.trim() || !!data.git_seed_paths?.trim())
+      && (
+        data.git_provider === 'github'
+          ? !!data.git_public || !!data.git_credential_id?.trim()
+          : !!data.git_credential_id?.trim()
+      )
   }
   return true
 }, {
@@ -85,12 +106,62 @@ interface BatchProgress {
   currentItem?: string
 }
 
+interface GitCredentialFormState {
+  provider: 'azure_devops' | 'github'
+  name: string
+  baseUrl: string
+  apiKey: string
+}
+
+function normalizeGitHubRepoInput(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return trimmed
+  }
+
+  let normalized = trimmed
+  let isGitHubUrl = false
+
+  if (normalized.startsWith('git@github.com:')) {
+    normalized = normalized.slice('git@github.com:'.length)
+    isGitHubUrl = true
+  } else if (normalized.startsWith('ssh://git@github.com/')) {
+    normalized = normalized.slice('ssh://git@github.com/'.length)
+    isGitHubUrl = true
+  } else if (
+    normalized.startsWith('https://github.com/')
+    || normalized.startsWith('http://github.com/')
+  ) {
+    try {
+      normalized = new URL(normalized).pathname.replace(/^\/+/, '')
+      isGitHubUrl = true
+    } catch {
+      normalized = normalized
+    }
+  } else if (normalized.startsWith('github.com/')) {
+    normalized = normalized.slice('github.com/'.length)
+    isGitHubUrl = true
+  }
+
+  normalized = normalized.replace(/\/+$/, '').replace(/\.git$/, '')
+
+  if (isGitHubUrl) {
+    const parts = normalized.split('/').filter(Boolean)
+    if (parts.length >= 2) {
+      return `${parts[0]}/${parts[1]}`
+    }
+  }
+
+  return normalized
+}
+
 export function AddSourceDialog({ 
   open, 
   onOpenChange, 
   defaultNotebookId 
 }: AddSourceDialogProps) {
-  const { t } = useTranslation()
+  const { t, language } = useTranslation()
+  const isPortuguese = language === 'pt-BR'
 
   const WIZARD_STEPS: readonly WizardStep[] = [
     { number: 1, title: t.sources.addSource, description: t.sources.processDescription },
@@ -116,9 +187,21 @@ export function AddSourceDialog({
 
   // API hooks
   const createSource = useCreateSource()
+  const createGitSyncSource = useCreateGitSyncSource()
+  const createCredential = useCreateCredential()
   const { data: notebooks = [], isLoading: notebooksLoading } = useNotebooks()
   const { data: transformations = [], isLoading: transformationsLoading } = useTransformations()
+  const { data: azureDevopsCredentials = [] } = useCredentialsByProvider('azure_devops')
+  const { data: githubCredentials = [] } = useCredentialsByProvider('github')
   const { data: settings } = useSettings()
+
+  const [gitCredentialDialogOpen, setGitCredentialDialogOpen] = useState(false)
+  const [gitCredentialForm, setGitCredentialForm] = useState<GitCredentialFormState>({
+    provider: 'azure_devops',
+    name: '',
+    baseUrl: '',
+    apiKey: '',
+  })
 
   // Form setup
   const {
@@ -136,6 +219,10 @@ export function AddSourceDialog({
       embed: settings?.default_embedding_option === 'always' || settings?.default_embedding_option === 'ask',
       async_processing: true,
       transformations: [],
+      git_provider: 'azure_devops',
+      git_public: false,
+      git_max_discovery_depth: 2,
+      git_max_discovery_files: 200,
     },
   })
 
@@ -157,6 +244,10 @@ export function AddSourceDialog({
         embed: embedValue,
         async_processing: true,
         transformations: [],
+        git_provider: 'azure_devops',
+        git_public: false,
+        git_max_discovery_depth: 2,
+        git_max_discovery_files: 200,
       })
     }
   }, [settings, transformations, defaultNotebookId, reset])
@@ -175,13 +266,36 @@ export function AddSourceDialog({
   const watchedContent = watch('content')
   const watchedFile = watch('file')
   const watchedTitle = watch('title')
+  const watchedGitPaths = watch('git_paths')
+  const watchedGitSeedPaths = watch('git_seed_paths')
+  const watchedGitProvider = watch('git_provider') || 'azure_devops'
+
+  const gitCredentials = useMemo(
+    () => watchedGitProvider === 'github' ? githubCredentials : azureDevopsCredentials,
+    [azureDevopsCredentials, githubCredentials, watchedGitProvider]
+  )
+
+  useEffect(() => {
+    const selectedCredentialId = watch('git_credential_id')
+    if (!selectedCredentialId) {
+      return
+    }
+    const hasSelectedCredential = gitCredentials.some(
+      credential => credential.id === selectedCredentialId
+    )
+    if (!hasSelectedCredential) {
+      setValue('git_credential_id', '', { shouldValidate: true })
+    }
+  }, [gitCredentials, setValue, watch, watchedGitProvider])
 
   // Batch mode detection
-  const { isBatchMode, itemCount, parsedUrls, parsedFiles } = useMemo(() => {
+  const { isBatchMode, itemCount, parsedUrls, parsedFiles, parsedGitPaths, parsedGitSeedPaths } = useMemo(() => {
     let urlCount = 0
     let fileCount = 0
     let parsedUrls: string[] = []
     let parsedFiles: File[] = []
+    let parsedGitPaths: string[] = []
+    let parsedGitSeedPaths: string[] = []
 
     if (selectedType === 'link' && watchedUrl) {
       const { valid } = parseAndValidateUrls(watchedUrl)
@@ -197,11 +311,25 @@ export function AddSourceDialog({
       }
     }
 
+    if (selectedType === 'git' && watchedGitPaths) {
+      parsedGitPaths = watchedGitPaths
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean)
+    }
+
+    if (selectedType === 'git' && watchedGitSeedPaths) {
+      parsedGitSeedPaths = watchedGitSeedPaths
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean)
+    }
+
     const isBatchMode = urlCount > 1 || fileCount > 1
     const itemCount = selectedType === 'link' ? urlCount : fileCount
 
-    return { isBatchMode, itemCount, parsedUrls, parsedFiles }
-  }, [selectedType, watchedUrl, watchedFile])
+    return { isBatchMode, itemCount, parsedUrls, parsedFiles, parsedGitPaths, parsedGitSeedPaths }
+  }, [selectedType, watchedUrl, watchedFile, watchedGitPaths, watchedGitSeedPaths])
 
   // Check for batch size limit
   const isOverLimit = itemCount > MAX_BATCH_SIZE
@@ -232,6 +360,16 @@ export function AddSourceDialog({
             return watchedFile.length > 0 && watchedFile.length <= MAX_BATCH_SIZE
           }
           return !!watchedFile
+        }
+        if (selectedType === 'git') {
+          return !!watch('git_repo')?.trim()
+            && !!watch('git_branch')?.trim()
+            && (parsedGitPaths.length > 0 || parsedGitSeedPaths.length > 0)
+            && (
+              watch('git_provider') === 'github'
+                ? !!watch('git_public') || !!watch('git_credential_id')?.trim()
+                : !!watch('git_credential_id')?.trim()
+            )
         }
         return true
       case 2:
@@ -296,10 +434,84 @@ export function AddSourceDialog({
     setSelectedTransformations(updated)
   }
 
+  const handleGitCredentialFieldChange = (
+    field: keyof GitCredentialFormState,
+    value: string
+  ) => {
+    setGitCredentialForm(prev => ({ ...prev, [field]: value }))
+  }
+
+  const handleCreateGitCredential = async () => {
+    const provider = gitCredentialForm.provider
+    const name = gitCredentialForm.name.trim()
+    const baseUrl = gitCredentialForm.baseUrl.trim()
+    const apiKey = gitCredentialForm.apiKey.trim()
+
+    if (!name || !apiKey || (provider === 'azure_devops' && !baseUrl)) {
+      toast.error(
+        provider === 'github'
+          ? (
+            isPortuguese
+              ? 'Preencha nome e PAT para salvar a credencial GitHub.'
+              : 'Fill in name and PAT to save the GitHub credential.'
+          )
+          : (
+            isPortuguese
+              ? 'Preencha nome, URL base e PAT para salvar a credencial.'
+              : 'Fill in name, base URL, and PAT to save the credential.'
+          )
+      )
+      return
+    }
+
+    try {
+      const credential = await createCredential.mutateAsync({
+        name,
+        provider,
+        modalities: ['source_sync'],
+        base_url: provider === 'azure_devops' ? baseUrl : undefined,
+        api_key: apiKey,
+      })
+
+      setValue('git_credential_id', credential.id, { shouldValidate: true })
+      setGitCredentialDialogOpen(false)
+      setGitCredentialForm({
+        provider,
+        name: '',
+        baseUrl: '',
+        apiKey: '',
+      })
+    } catch {
+      // Toast is already handled by the credential mutation hook.
+    }
+  }
+
   // Single source submission
   const submitSingleSource = async (data: CreateSourceFormData): Promise<void> => {
+    if (data.type === 'git') {
+      const provider = data.git_provider || 'azure_devops'
+      const repo = provider === 'github'
+        ? normalizeGitHubRepoInput(data.git_repo || '')
+        : data.git_repo!.trim()
+
+      await createGitSyncSource.mutateAsync({
+        provider,
+        repo,
+        branch: data.git_branch!.trim(),
+        paths: parsedGitPaths,
+        seed_paths: parsedGitSeedPaths,
+        max_discovery_depth: data.git_max_discovery_depth,
+        max_discovery_files: data.git_max_discovery_files,
+        credential_id: data.git_credential_id?.trim() || undefined,
+        notebooks: selectedNotebooks,
+        transformations: selectedTransformations,
+        embed: data.embed,
+      })
+      return
+    }
+
     const createRequest: CreateSourceRequest = {
-      type: data.type,
+      type: data.type as 'link' | 'upload' | 'text',
       notebooks: selectedNotebooks,
       url: data.type === 'link' ? data.url : undefined,
       content: data.type === 'text' ? data.content : undefined,
@@ -404,7 +616,11 @@ export function AddSourceDialog({
         handleClose()
       } else {
         // Single source submission
-        setProcessingStatus({ message: t.sources.submittingSource })
+        setProcessingStatus({
+          message: data.type === 'git'
+            ? (isPortuguese ? 'Sincronizando arquivos do repositório privado...' : 'Syncing files from the private repository...')
+            : t.sources.submittingSource,
+        })
         await submitSingleSource(data)
         handleClose()
       }
@@ -436,6 +652,8 @@ export function AddSourceDialog({
     setSelectedNotebooks(defaultNotebookId ? [defaultNotebookId] : [])
     setUrlValidationErrors([])
     setBatchProgress(null)
+    setGitCredentialDialogOpen(false)
+    setGitCredentialForm({ provider: watchedGitProvider, name: '', baseUrl: '', apiKey: '' })
 
     // Reset to default transformations
     if (transformations.length > 0) {
@@ -559,6 +777,15 @@ export function AddSourceDialog({
                 errors={errors}
                 urlValidationErrors={urlValidationErrors}
                 onClearUrlErrors={handleClearUrlErrors}
+                gitCredentials={gitCredentials}
+                onOpenGitCredentialDialog={() => {
+                  setGitCredentialForm(prev => ({
+                    ...prev,
+                    provider: watchedGitProvider,
+                    baseUrl: watchedGitProvider === 'github' ? '' : prev.baseUrl,
+                  }))
+                  setGitCredentialDialogOpen(true)
+                }}
               />
             )}
             
@@ -620,15 +847,97 @@ export function AddSourceDialog({
               {/* Show Done button on all steps, styled as primary */}
               <Button
                 type="submit"
-                disabled={!currentStepValid || createSource.isPending}
+                disabled={!currentStepValid || createSource.isPending || createGitSyncSource.isPending}
                 className="min-w-[120px]"
               >
-                {createSource.isPending ? t.common.adding : t.common.done}
+                {createSource.isPending || createGitSyncSource.isPending ? t.common.adding : t.common.done}
               </Button>
             </div>
           </div>
         </form>
       </DialogContent>
+
+      <Dialog open={gitCredentialDialogOpen} onOpenChange={setGitCredentialDialogOpen}>
+        <DialogContent className="sm:max-w-[520px]">
+          <DialogHeader>
+            <DialogTitle>
+              {gitCredentialForm.provider === 'github'
+                ? (isPortuguese ? 'Nova credencial GitHub' : 'New GitHub credential')
+                : (isPortuguese ? 'Nova credencial Azure DevOps' : 'New Azure DevOps credential')}
+            </DialogTitle>
+            <DialogDescription>
+              {gitCredentialForm.provider === 'github'
+                ? (
+                  isPortuguese
+                    ? 'Salve o PAT do GitHub para acessar repositórios privados ou evitar limites de uso.'
+                    : 'Save the GitHub PAT to access private repositories or avoid rate limits.'
+                )
+                : (
+                  isPortuguese
+                    ? 'Salve o PAT e a URL base para acessar o repositório privado via RAW.'
+                    : 'Save the PAT and base URL used to access the private repository through RAW.'
+                )}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <label className="text-sm font-medium">
+                {isPortuguese ? 'Nome da credencial' : 'Credential name'}
+              </label>
+              <input
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                value={gitCredentialForm.name}
+                onChange={(e) => handleGitCredentialFieldChange('name', e.target.value)}
+                placeholder={isPortuguese ? 'Azure DevOps Produção' : 'Azure DevOps Production'}
+              />
+            </div>
+
+            {gitCredentialForm.provider === 'azure_devops' && (
+              <div className="space-y-2">
+                <label className="text-sm font-medium">
+                  {isPortuguese ? 'URL base do Azure DevOps' : 'Azure DevOps base URL'}
+                </label>
+                <input
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={gitCredentialForm.baseUrl}
+                  onChange={(e) => handleGitCredentialFieldChange('baseUrl', e.target.value)}
+                  placeholder="https://dev.azure.com/your-org/your-project"
+                />
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium">PAT</label>
+              <input
+                type="password"
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                value={gitCredentialForm.apiKey}
+                onChange={(e) => handleGitCredentialFieldChange('apiKey', e.target.value)}
+                placeholder={isPortuguese ? 'Cole o token de acesso pessoal' : 'Paste the personal access token'}
+              />
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setGitCredentialDialogOpen(false)}
+              disabled={createCredential.isPending}
+            >
+              {t.common.cancel}
+            </Button>
+            <Button
+              type="button"
+              onClick={handleCreateGitCredential}
+              disabled={createCredential.isPending}
+            >
+              {createCredential.isPending ? t.common.saving : (isPortuguese ? 'Salvar credencial' : 'Save credential')}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </Dialog>
   )
 }

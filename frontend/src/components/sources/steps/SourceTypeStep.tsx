@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react"
 import { Control, FieldErrors, UseFormRegister, UseFormSetValue, useWatch } from "react-hook-form"
-import { FileIcon, LinkIcon, FileTextIcon } from "lucide-react"
+import { FileIcon, LinkIcon, FileTextIcon, GitBranchIcon } from "lucide-react"
 import { useTranslation } from "@/lib/hooks/use-translation"
 import { FormSection } from "@/components/ui/form-section"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
@@ -13,11 +13,20 @@ import { Badge } from "@/components/ui/badge"
 import { Controller } from "react-hook-form"
 
 interface CreateSourceFormData {
-  type: 'link' | 'upload' | 'text'
+  type: 'link' | 'upload' | 'text' | 'git'
   title?: string
   url?: string
   content?: string
   file?: FileList | File
+  git_provider?: 'azure_devops' | 'github'
+  git_public?: boolean
+  git_repo?: string
+  git_branch?: string
+  git_paths?: string
+  git_seed_paths?: string
+  git_max_discovery_depth?: number
+  git_max_discovery_files?: number
+  git_credential_id?: string
   notebooks?: string[]
   transformations?: string[]
   embed: boolean
@@ -65,7 +74,7 @@ export function parseAndValidateUrls(text: string): {
 
 import { TranslationKeys } from '@/lib/locales'
 
-const getSourceTypes = (t: TranslationKeys) => [
+const getSourceTypes = (t: TranslationKeys, isPortuguese: boolean) => [
   {
     value: 'link' as const,
     label: t.sources.addUrl,
@@ -84,6 +93,14 @@ const getSourceTypes = (t: TranslationKeys) => [
     icon: FileTextIcon,
     description: t.sources.processDescription,
   },
+  {
+    value: 'git' as const,
+    label: isPortuguese ? 'Git privado' : 'Private Git',
+    icon: GitBranchIcon,
+    description: isPortuguese
+      ? 'Sincronize arquivos do repositório e descubra docs vinculados por README/índices.'
+      : 'Sync repository files and discover linked docs through README/index files.',
+  },
 ]
 
 interface SourceTypeStepProps {
@@ -93,16 +110,30 @@ interface SourceTypeStepProps {
   errors: FieldErrors<CreateSourceFormData>
   urlValidationErrors?: { url: string; line: number }[]
   onClearUrlErrors?: () => void
+  gitCredentials?: Array<{ id: string; name: string }>
+  onOpenGitCredentialDialog?: () => void
 }
 
 const MAX_BATCH_SIZE = 50
 
-export function SourceTypeStep({ control, register, setValue, errors, urlValidationErrors, onClearUrlErrors }: SourceTypeStepProps) {
-  const { t } = useTranslation()
+export function SourceTypeStep({
+  control,
+  register,
+  setValue,
+  errors,
+  urlValidationErrors,
+  onClearUrlErrors,
+  gitCredentials = [],
+  onOpenGitCredentialDialog,
+}: SourceTypeStepProps) {
+  const { t, language } = useTranslation()
+  const isPortuguese = language === 'pt-BR'
   // Watch the selected type and inputs to detect batch mode
   const selectedType = useWatch({ control, name: 'type' })
   const urlInput = useWatch({ control, name: 'url' })
   const fileInput = useWatch({ control, name: 'file' })
+  const gitProvider = useWatch({ control, name: 'git_provider' }) || 'azure_devops'
+  const gitPublic = useWatch({ control, name: 'git_public' }) ?? false
 
   // Track if HTML content was pasted
   const [hasHtmlContent, setHasHtmlContent] = useState(false)
@@ -165,11 +196,11 @@ export function SourceTypeStep({ control, register, setValue, errors, urlValidat
           render={({ field }) => (
             <Tabs 
               value={field.value || ''} 
-              onValueChange={(value) => field.onChange(value as 'link' | 'upload' | 'text')}
+              onValueChange={(value) => field.onChange(value as 'link' | 'upload' | 'text' | 'git')}
               className="w-full"
             >
-              <TabsList className="grid w-full grid-cols-3">
-                {getSourceTypes(t).map((type) => {
+              <TabsList className="grid w-full grid-cols-4">
+                {getSourceTypes(t, isPortuguese).map((type) => {
                   const Icon = type.icon
                   return (
                     <TabsTrigger key={type.value} value={type.value} className="gap-2">
@@ -180,7 +211,7 @@ export function SourceTypeStep({ control, register, setValue, errors, urlValidat
                 })}
               </TabsList>
               
-              {getSourceTypes(t).map((type) => (
+              {getSourceTypes(t, isPortuguese).map((type) => (
                 <TabsContent key={type.value} value={type.value} className="mt-4">
                   <p className="text-sm text-muted-foreground mb-4">{type.description}</p>
                   
@@ -304,6 +335,209 @@ export function SourceTypeStep({ control, register, setValue, errors, urlValidat
                       )}
                     </div>
                   )}
+
+                  {type.value === 'git' && (
+                    <div className="space-y-4">
+                      <div>
+                        <Label htmlFor="git_provider" className="mb-2 block">
+                          {isPortuguese ? 'Provider Git *' : 'Git provider *'}
+                        </Label>
+                        <select
+                          id="git_provider"
+                          {...register('git_provider')}
+                          className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                          defaultValue="azure_devops"
+                        >
+                          <option value="azure_devops">Azure DevOps</option>
+                          <option value="github">GitHub</option>
+                        </select>
+                      </div>
+
+                      <div className="flex items-center gap-2 rounded-md border border-input px-3 py-2">
+                        <input
+                          id="git_public"
+                          type="checkbox"
+                          {...register('git_public')}
+                          className="h-4 w-4"
+                        />
+                        <Label htmlFor="git_public" className="text-sm font-normal">
+                          {isPortuguese ? 'Repositório público' : 'Public repository'}
+                        </Label>
+                      </div>
+
+                      <div>
+                        <Label htmlFor="git_repo" className="mb-2 block">
+                          {isPortuguese ? 'Repositório *' : 'Repository *'}
+                        </Label>
+                        <Input
+                          id="git_repo"
+                          {...register('git_repo')}
+                          placeholder={
+                            gitProvider === 'github'
+                              ? 'owner/repo or https://github.com/owner/repo'
+                              : (isPortuguese ? 'nome-ou-id-do-repo' : 'repo-name-or-id')
+                          }
+                          autoComplete="off"
+                        />
+                        {errors.git_repo && (
+                          <p className="text-sm text-destructive mt-1">{errors.git_repo.message}</p>
+                        )}
+                      </div>
+
+                      <div>
+                        <Label htmlFor="git_branch" className="mb-2 block">
+                          {isPortuguese ? 'Branch *' : 'Branch *'}
+                        </Label>
+                        <Input
+                          id="git_branch"
+                          {...register('git_branch')}
+                          placeholder="main"
+                          autoComplete="off"
+                        />
+                        {errors.git_branch && (
+                          <p className="text-sm text-destructive mt-1">{errors.git_branch.message}</p>
+                        )}
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <Label htmlFor="git_credential_id">
+                            {gitProvider === 'github'
+                              ? (
+                                gitPublic
+                                  ? (isPortuguese ? 'Credencial GitHub (opcional)' : 'GitHub credential (optional)')
+                                  : (isPortuguese ? 'Credencial GitHub *' : 'GitHub credential *')
+                              )
+                              : (isPortuguese ? 'Credencial Azure DevOps *' : 'Azure DevOps credential *')}
+                          </Label>
+                          <button
+                            type="button"
+                            onClick={onOpenGitCredentialDialog}
+                            className="text-xs text-primary hover:underline"
+                          >
+                            {isPortuguese ? 'Nova credencial' : 'New credential'}
+                          </button>
+                        </div>
+                        <select
+                          id="git_credential_id"
+                          {...register('git_credential_id')}
+                          className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                          defaultValue=""
+                        >
+                          <option value="">
+                            {gitProvider === 'github' && gitPublic
+                              ? (isPortuguese ? 'Sem credencial' : 'No credential')
+                              : (isPortuguese ? 'Selecione uma credencial' : 'Select a credential')}
+                          </option>
+                          {gitCredentials.map((credential) => (
+                            <option key={credential.id} value={credential.id}>
+                              {credential.name}
+                            </option>
+                          ))}
+                        </select>
+                        {gitCredentials.length === 0 && (
+                          <p className="text-xs text-muted-foreground mt-1">
+                            {gitProvider === 'github'
+                              ? (
+                                gitPublic
+                                  ? (isPortuguese ? 'Você pode continuar sem token, ou criar uma credencial GitHub para repositórios privados.' : 'You can continue without a token, or create a GitHub credential for private repositories.')
+                                  : (isPortuguese ? 'Nenhuma credencial GitHub encontrada. Crie uma para continuar.' : 'No GitHub credential found. Create one to continue.')
+                              )
+                              : (
+                                isPortuguese
+                                  ? 'Nenhuma credencial Azure DevOps encontrada. Crie uma para continuar.'
+                                  : 'No Azure DevOps credential found. Create one to continue.'
+                              )}
+                          </p>
+                        )}
+                        {errors.git_credential_id && (
+                          <p className="text-sm text-destructive mt-1">{errors.git_credential_id.message}</p>
+                        )}
+                      </div>
+
+                      <div>
+                        <Label htmlFor="git_paths" className="mb-2 block">
+                          {isPortuguese ? 'Arquivos explícitos' : 'Explicit files'}
+                        </Label>
+                        <Textarea
+                          id="git_paths"
+                          {...register('git_paths')}
+                          placeholder={isPortuguese
+                            ? 'docs/guia.md\ndocs/arquitetura.md\ndiagramas/fluxo.puml'
+                            : 'docs/guide.md\ndocs/architecture.md\ndiagrams/flow.puml'}
+                          rows={5}
+                          className="font-mono text-sm"
+                        />
+                        <p className="text-xs text-muted-foreground mt-1">
+                          {gitProvider === 'github'
+                            ? (
+                              isPortuguese
+                                ? 'Informe um caminho por linha. Pode incluir `.md`, `.puml` e `.svg`.'
+                                : 'Provide one path per line. You can include `.md`, `.puml`, and `.svg`.'
+                            )
+                            : (
+                              isPortuguese
+                                ? 'Informe um caminho por linha. O sync vai criar ou atualizar as fontes automaticamente.'
+                                : 'Provide one path per line. The sync will create or update sources automatically.'
+                            )}
+                        </p>
+                        {errors.git_paths && (
+                          <p className="text-sm text-destructive mt-1">{errors.git_paths.message}</p>
+                        )}
+                      </div>
+
+                      <div>
+                        <Label htmlFor="git_seed_paths" className="mb-2 block">
+                          {isPortuguese ? 'Arquivos-semente' : 'Seed files'}
+                        </Label>
+                        <Textarea
+                          id="git_seed_paths"
+                          {...register('git_seed_paths')}
+                          placeholder={isPortuguese
+                            ? 'README.md\ndocs/index.md'
+                            : 'README.md\ndocs/index.md'}
+                          rows={4}
+                          className="font-mono text-sm"
+                        />
+                        <p className="text-xs text-muted-foreground mt-1">
+                          {isPortuguese
+                            ? 'Arquivos Markdown usados para descobrir links internos do repositório. Links para `.puml` e `.svg` também serão ingeridos.'
+                            : 'Markdown files used to discover internal repository links. Links to `.puml` and `.svg` will also be ingested.'}
+                        </p>
+                        {errors.git_seed_paths && (
+                          <p className="text-sm text-destructive mt-1">{errors.git_seed_paths.message}</p>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                        <div>
+                          <Label htmlFor="git_max_discovery_depth" className="mb-2 block">
+                            {isPortuguese ? 'Profundidade máxima' : 'Max discovery depth'}
+                          </Label>
+                          <Input
+                            id="git_max_discovery_depth"
+                            type="number"
+                            min={0}
+                            max={10}
+                            {...register('git_max_discovery_depth', { valueAsNumber: true })}
+                          />
+                        </div>
+
+                        <div>
+                          <Label htmlFor="git_max_discovery_files" className="mb-2 block">
+                            {isPortuguese ? 'Máximo de arquivos' : 'Max discovered files'}
+                          </Label>
+                          <Input
+                            id="git_max_discovery_files"
+                            type="number"
+                            min={1}
+                            max={5000}
+                            {...register('git_max_discovery_files', { valueAsNumber: true })}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </TabsContent>
               ))}
             </Tabs>
@@ -315,7 +549,7 @@ export function SourceTypeStep({ control, register, setValue, errors, urlValidat
       </FormSection>
 
       {/* Hide title field in batch mode - titles will be auto-generated */}
-      {!isBatchMode && (
+      {!isBatchMode && selectedType !== 'git' && (
         <FormSection
           htmlFor="source-title"
           title={selectedType === 'text' ? `${t.common.title} *` : `${t.common.title} (${t.common.optional})`}

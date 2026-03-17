@@ -31,6 +31,7 @@ from api.routers import (
     embedding,
     embedding_rebuild,
     episode_profiles,
+    git_syncs,
     insights,
     models,
     notebooks,
@@ -269,6 +270,7 @@ app.include_router(speaker_profiles.router, prefix="/api", tags=["speaker-profil
 app.include_router(chat.router, prefix="/api", tags=["chat"])
 app.include_router(source_chat.router, prefix="/api", tags=["source-chat"])
 app.include_router(credentials.router, prefix="/api", tags=["credentials"])
+app.include_router(git_syncs.router, prefix="/api", tags=["git-syncs"])
 
 
 @app.get("/")

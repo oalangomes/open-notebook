@@ -1,0 +1,4 @@
+-- Rollback Migration 14: Remove git sync configuration/state
+
+REMOVE INDEX idx_git_sync_provider_repo_branch ON git_sync;
+REMOVE TABLE git_sync;

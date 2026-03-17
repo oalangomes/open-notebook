@@ -1,0 +1,6 @@
+-- Migration 16: Add markdown discovery settings to git sync
+
+DEFINE FIELD seed_paths ON git_sync TYPE array DEFAULT [];
+DEFINE FIELD seed_paths.* ON git_sync TYPE string;
+DEFINE FIELD max_discovery_depth ON git_sync TYPE int DEFAULT 2;
+DEFINE FIELD max_discovery_files ON git_sync TYPE int DEFAULT 200;

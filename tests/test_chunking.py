@@ -48,6 +48,8 @@ class TestDetectContentTypeFromExtension:
         assert detect_content_type_from_extension("file.js") == ContentType.PLAIN
         assert detect_content_type_from_extension("file.json") == ContentType.PLAIN
         assert detect_content_type_from_extension("file.yaml") == ContentType.PLAIN
+        assert detect_content_type_from_extension("diagram.puml") == ContentType.PLAIN
+        assert detect_content_type_from_extension("vector.svg") == ContentType.PLAIN
 
     def test_unknown_extensions(self):
         """Test unknown extensions return None."""

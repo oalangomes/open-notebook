@@ -57,6 +57,13 @@ PROVIDER_ENV_CONFIG: Dict[str, dict] = {
     "openai_compatible": {
         "required_any": ["OPENAI_COMPATIBLE_BASE_URL", "OPENAI_COMPATIBLE_API_KEY"],
     },
+    "github": {
+        "required": ["GITHUB_PAT"],
+    },
+    "azure_devops": {
+        "required": ["AZURE_DEVOPS_PAT"],
+        "optional": ["AZURE_DEVOPS_BASE_URL"],
+    },
 }
 
 PROVIDER_MODALITIES: Dict[str, List[str]] = {
@@ -74,6 +81,8 @@ PROVIDER_MODALITIES: Dict[str, List[str]] = {
     "vertex": ["language", "embedding"],
     "azure": ["language", "embedding", "speech_to_text", "text_to_speech"],
     "openai_compatible": ["language", "embedding", "speech_to_text", "text_to_speech"],
+    "github": ["source_sync"],
+    "azure_devops": ["source_sync"],
 }
 
 
@@ -283,6 +292,23 @@ def create_credential_from_env(provider: str) -> Credential:
             api_key=SecretStr(api_key) if api_key else None,
             base_url=os.environ.get("OPENAI_COMPATIBLE_BASE_URL"),
         )
+    elif provider == "azure_devops":
+        api_key = os.environ.get("AZURE_DEVOPS_PAT")
+        return Credential(
+            name=name,
+            provider=provider,
+            modalities=modalities,
+            api_key=SecretStr(api_key) if api_key else None,
+            base_url=os.environ.get("AZURE_DEVOPS_BASE_URL"),
+        )
+    elif provider == "github":
+        api_key = os.environ.get("GITHUB_PAT")
+        return Credential(
+            name=name,
+            provider=provider,
+            modalities=modalities,
+            api_key=SecretStr(api_key) if api_key else None,
+        )
     elif provider == "google":
         # Support both GOOGLE_API_KEY and GEMINI_API_KEY (fallback)
         api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
@@ -399,6 +425,99 @@ async def test_credential(credential_id: str) -> dict:
                 api_version=config.get("api_version"),
             )
             return {"provider": provider, "success": success, "message": message}
+
+        if provider == "azure_devops":
+            base_url = config.get("base_url")
+            api_key = config.get("api_key")
+            if not base_url:
+                return {
+                    "provider": provider,
+                    "success": False,
+                    "message": "No base URL configured",
+                }
+            if not api_key:
+                return {
+                    "provider": provider,
+                    "success": False,
+                    "message": "No PAT configured",
+                }
+
+            import base64
+
+            token = base64.b64encode(f":{api_key}".encode("utf-8")).decode("ascii")
+            headers = {"Authorization": f"Basic {token}"}
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{base_url.rstrip('/')}/_apis/projects?api-version=7.1",
+                    headers=headers,
+                    timeout=15.0,
+                )
+                if response.status_code == 200:
+                    return {
+                        "provider": provider,
+                        "success": True,
+                        "message": "Connection successful",
+                    }
+                if response.status_code == 401:
+                    return {
+                        "provider": provider,
+                        "success": False,
+                        "message": "Invalid PAT",
+                    }
+                if response.status_code == 403:
+                    return {
+                        "provider": provider,
+                        "success": False,
+                        "message": "PAT lacks required permissions",
+                    }
+                return {
+                    "provider": provider,
+                    "success": False,
+                    "message": f"Azure DevOps returned status {response.status_code}",
+                }
+
+        if provider == "github":
+            api_key = config.get("api_key")
+            if not api_key:
+                return {
+                    "provider": provider,
+                    "success": False,
+                    "message": "No PAT configured",
+                }
+
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/vnd.github+json",
+            }
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    "https://api.github.com/user",
+                    headers=headers,
+                    timeout=15.0,
+                )
+                if response.status_code == 200:
+                    return {
+                        "provider": provider,
+                        "success": True,
+                        "message": "Connection successful",
+                    }
+                if response.status_code == 401:
+                    return {
+                        "provider": provider,
+                        "success": False,
+                        "message": "Invalid PAT",
+                    }
+                if response.status_code == 403:
+                    return {
+                        "provider": provider,
+                        "success": False,
+                        "message": "PAT lacks required permissions",
+                    }
+                return {
+                    "provider": provider,
+                    "success": False,
+                    "message": f"GitHub returned status {response.status_code}",
+                }
 
         # Standard provider: use Esperanto to create and test
         from esperanto.factory import AIFactory
@@ -584,6 +703,9 @@ async def discover_with_config(provider: str, config: dict) -> List[dict]:
             "text-embedding-005",
         ]
         return [{"name": m, "provider": "vertex"} for m in VERTEX_MODELS]
+
+    if provider in {"azure_devops", "github"}:
+        return []
 
     if provider == "google":
         try:

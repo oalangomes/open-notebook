@@ -133,6 +133,8 @@ _EXTENSION_TO_CONTENT_TYPE = {
     ".yaml": ContentType.PLAIN,
     ".yml": ContentType.PLAIN,
     ".xml": ContentType.PLAIN,
+    ".svg": ContentType.PLAIN,
+    ".puml": ContentType.PLAIN,
     ".csv": ContentType.PLAIN,
     ".tsv": ContentType.PLAIN,
 }

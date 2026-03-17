@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Literal, Optional
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -662,6 +663,212 @@ class RegisterModelsResponse(BaseModel):
 
     created: int
     existing: int
+
+
+class GitSyncFileStateResponse(BaseModel):
+    path: str
+    raw_url: Optional[str] = None
+    source_id: Optional[str] = None
+    content_hash: Optional[str] = None
+    last_sync: Optional[str] = None
+    last_status: Optional[str] = None
+    last_error: Optional[str] = None
+    active: bool = True
+
+
+class GitSyncRunSummaryResponse(BaseModel):
+    created: int = 0
+    updated: int = 0
+    skipped: int = 0
+    failed: int = 0
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+
+
+def normalize_github_repo_input(value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        return cleaned
+
+    is_github_url = False
+
+    if cleaned.startswith("git@github.com:"):
+        cleaned = cleaned.split("git@github.com:", 1)[1]
+        is_github_url = True
+    elif cleaned.startswith("ssh://git@github.com/"):
+        cleaned = cleaned.split("ssh://git@github.com/", 1)[1]
+        is_github_url = True
+    elif cleaned.startswith("https://github.com/") or cleaned.startswith(
+        "http://github.com/"
+    ):
+        cleaned = urlparse(cleaned).path.lstrip("/")
+        is_github_url = True
+    elif cleaned.startswith("github.com/"):
+        cleaned = cleaned.split("github.com/", 1)[1]
+        is_github_url = True
+
+    cleaned = cleaned.rstrip("/")
+    if cleaned.endswith(".git"):
+        cleaned = cleaned[:-4]
+
+    parts = [part for part in cleaned.split("/") if part]
+    if is_github_url and len(parts) >= 2:
+        return "/".join(parts[:2])
+
+    return cleaned
+
+
+class GitSyncCreateRequest(BaseModel):
+    provider: Literal["azure_devops", "github"] = Field(
+        ..., description="Remote Git provider for RAW markdown sync"
+    )
+    repo: str = Field(..., description="Repository name or ID")
+    branch: str = Field(..., description="Branch name")
+    paths: List[str] = Field(
+        default_factory=list, description="Explicit list of repository file paths"
+    )
+    seed_paths: List[str] = Field(
+        default_factory=list,
+        description="Seed markdown paths used to discover linked repository files",
+    )
+    max_discovery_depth: int = Field(
+        2, description="Maximum recursive markdown discovery depth", ge=0, le=10
+    )
+    max_discovery_files: int = Field(
+        200, description="Maximum number of discovered files per sync", ge=1, le=5000
+    )
+    credential_id: Optional[str] = Field(
+        None, description="Credential ID with PAT access"
+    )
+    notebooks: List[str] = Field(
+        default_factory=list, description="Notebook IDs to link synced sources to"
+    )
+    transformations: List[str] = Field(
+        default_factory=list, description="Transformation IDs to apply"
+    )
+    embed: bool = Field(False, description="Whether to generate embeddings")
+    refresh_interval: Optional[str] = Field(
+        None, description="Informational refresh interval string"
+    )
+
+    @field_validator("repo", "branch", "credential_id", "refresh_interval", mode="before")
+    @classmethod
+    def strip_optional_strings(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        value = v.strip()
+        return value or None
+
+    @field_validator("paths", "seed_paths", mode="before")
+    @classmethod
+    def normalize_paths(cls, v):
+        if v is None:
+            return []
+        normalized = []
+        for item in v:
+            if not isinstance(item, str):
+                raise ValueError("Each path must be a string")
+            cleaned = item.strip()
+            if not cleaned:
+                raise ValueError("Paths cannot contain empty values")
+            normalized.append(cleaned)
+        if not normalized:
+            return []
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_provider_specific_fields(self):
+        if not self.paths and not self.seed_paths:
+            raise ValueError("At least one explicit path or seed_path must be provided")
+        if self.provider == "azure_devops" and not self.credential_id:
+            raise ValueError("credential_id is required for Azure DevOps sync")
+        if self.provider == "github":
+            self.repo = normalize_github_repo_input(self.repo)
+            repo_parts = [part for part in self.repo.split("/") if part]
+            if len(repo_parts) != 2:
+                raise ValueError("GitHub repo must use the format 'owner/repo'")
+        return self
+
+
+class GitSyncUpdateRequest(BaseModel):
+    branch: Optional[str] = Field(None, description="Branch name")
+    paths: Optional[List[str]] = Field(
+        None, description="Explicit list of repository file paths"
+    )
+    seed_paths: Optional[List[str]] = Field(
+        None, description="Seed markdown paths used to discover linked repository files"
+    )
+    max_discovery_depth: Optional[int] = Field(
+        None, description="Maximum recursive markdown discovery depth", ge=0, le=10
+    )
+    max_discovery_files: Optional[int] = Field(
+        None, description="Maximum number of discovered files per sync", ge=1, le=5000
+    )
+    credential_id: Optional[str] = Field(
+        None, description="Credential ID with PAT access"
+    )
+    notebooks: Optional[List[str]] = Field(
+        None, description="Notebook IDs to link synced sources to"
+    )
+    transformations: Optional[List[str]] = Field(
+        None, description="Transformation IDs to apply"
+    )
+    embed: Optional[bool] = Field(None, description="Whether to generate embeddings")
+    refresh_interval: Optional[str] = Field(
+        None, description="Informational refresh interval string"
+    )
+
+    @field_validator("branch", "credential_id", "refresh_interval", mode="before")
+    @classmethod
+    def strip_update_strings(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        value = v.strip()
+        return value or None
+
+    @field_validator("paths", "seed_paths", mode="before")
+    @classmethod
+    def normalize_update_paths(cls, v):
+        if v is None:
+            return None
+        normalized = []
+        for item in v:
+            if not isinstance(item, str):
+                raise ValueError("Each path must be a string")
+            cleaned = item.strip()
+            if not cleaned:
+                raise ValueError("Paths cannot contain empty values")
+            normalized.append(cleaned)
+        return normalized
+
+
+class GitSyncResponse(BaseModel):
+    id: str
+    provider: str
+    repo: str
+    branch: str
+    paths: List[str]
+    seed_paths: List[str]
+    max_discovery_depth: int
+    max_discovery_files: int
+    credential_id: Optional[str] = None
+    notebooks: List[str]
+    transformations: List[str]
+    embed: bool
+    refresh_interval: Optional[str] = None
+    last_sync: Optional[str] = None
+    last_status: Optional[str] = None
+    last_error: Optional[str] = None
+    last_run_summary: Optional[GitSyncRunSummaryResponse] = None
+    file_states: List[GitSyncFileStateResponse] = Field(default_factory=list)
+    created: str
+    updated: str
+
+
+class GitSyncRunResponse(BaseModel):
+    sync_id: str
+    summary: GitSyncRunSummaryResponse
+    file_states: List[GitSyncFileStateResponse] = Field(default_factory=list)
 
 
 class NotebookDeletePreview(BaseModel):
