@@ -1,3 +1,4 @@
+import asyncio
 import time
 from typing import Any, Dict, List, Optional
 
@@ -8,7 +9,7 @@ from surreal_commands import CommandInput, CommandOutput, command
 from open_notebook.database.repository import ensure_record_id
 from open_notebook.domain.notebook import Asset, Source
 from open_notebook.domain.transformation import Transformation
-from open_notebook.exceptions import ConfigurationError
+from open_notebook.exceptions import ConfigurationError, NotFoundError
 
 try:
     from open_notebook.graphs.source import source_graph
@@ -44,6 +45,30 @@ class SourceProcessingOutput(CommandOutput):
     insights_created: int = 0
     processing_time: float
     error_message: Optional[str] = None
+
+
+SOURCE_LOOKUP_ATTEMPTS = 3
+SOURCE_LOOKUP_DELAY_SECONDS = 0.2
+
+
+async def _get_source_with_retry(source_id: str) -> Source:
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, SOURCE_LOOKUP_ATTEMPTS + 1):
+        try:
+            return await Source.get(source_id)
+        except NotFoundError as exc:
+            last_error = exc
+            if attempt == SOURCE_LOOKUP_ATTEMPTS:
+                break
+            logger.warning(
+                f"Source {source_id} not found on attempt {attempt}/{SOURCE_LOOKUP_ATTEMPTS}; retrying"
+            )
+            await asyncio.sleep(SOURCE_LOOKUP_DELAY_SECONDS)
+
+    raise ValueError(
+        f"Source '{source_id}' not found after {SOURCE_LOOKUP_ATTEMPTS} attempts"
+    ) from last_error
 
 
 @command(
@@ -84,9 +109,7 @@ async def process_source_command(
         logger.info(f"Loaded {len(transformations)} transformations")
 
         # 2. Get existing source record to update its command field
-        source = await Source.get(input_data.source_id)
-        if not source:
-            raise ValueError(f"Source '{input_data.source_id}' not found")
+        source = await _get_source_with_retry(input_data.source_id)
 
         # Update source with command reference
         source.command = (
@@ -107,9 +130,12 @@ async def process_source_command(
                 f"Using pre-extracted content for source {input_data.source_id}; "
                 "skipping remote fetch/extraction"
             )
+            existing_asset = source.asset
             source.asset = Asset(
-                url=input_data.content_state.get("url"),
-                file_path=input_data.content_state.get("file_path"),
+                url=input_data.content_state.get("url")
+                or (existing_asset.url if existing_asset else None),
+                file_path=input_data.content_state.get("file_path")
+                or (existing_asset.file_path if existing_asset else None),
             )
             source.full_text = pre_extracted_content
             if input_data.content_state.get("title"):

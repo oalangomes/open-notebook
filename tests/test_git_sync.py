@@ -9,7 +9,7 @@ from api.git_sync_service import GitSyncService
 from api.models import GitSyncCreateRequest
 from open_notebook.domain.credential import Credential
 from open_notebook.domain.git_sync import GitSync, GitSyncFileState
-from open_notebook.domain.notebook import Source
+from open_notebook.domain.notebook import Asset, Source
 
 
 class TestGitRawClient:
@@ -258,6 +258,51 @@ class TestGitSyncService:
         assert "credential_id is required" in str(exc.value.detail)
 
     @pytest.mark.asyncio
+    async def test_preview_sync_returns_source_metadata_for_discovered_files(self):
+        request = GitSyncCreateRequest(
+            provider="github",
+            repo="owner/repo",
+            branch="main",
+            paths=["docs/guide.md"],
+            seed_paths=["README.md"],
+            credential_id=None,
+        )
+        client = AsyncMock()
+        client.fetch_text_file = AsyncMock(
+            return_value=RawFetchResult(
+                raw_url="https://raw/readme",
+                content="[Flow](docs/flow.puml)\n![Architecture](assets/system.svg)",
+                content_hash="hash-readme",
+            )
+        )
+
+        with patch.object(
+            GitSyncService,
+            "_validate_discovery_config",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            GitSyncService,
+            "_get_valid_credential",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            GitSyncService, "_build_client", return_value=client
+        ):
+            response = await GitSyncService.preview_sync(request)
+
+        assert [item.path for item in response.items] == [
+            "docs/guide.md",
+            "README.md",
+            "docs/flow.puml",
+            "assets/system.svg",
+        ]
+        assert response.items[0].source_type == "explicit"
+        assert response.items[1].source_type == "seed"
+        assert response.items[2].source_type == "discovered"
+        assert response.items[2].discovered_from == "README.md"
+        assert response.items[2].file_type == "puml"
+        assert response.items[3].file_type == "svg"
+
+    @pytest.mark.asyncio
     async def test_resolve_source_uses_repo_path_as_title(self):
         sync = GitSync(
             id="git_sync:resolve",
@@ -322,7 +367,12 @@ class TestGitSyncService:
             ]
         )
         created_source = Source(id="source:new", title="new.md")
-        existing_source = Source(id="source:skip", title="skip.md")
+        existing_source = Source(
+            id="source:skip",
+            title="skip.md",
+            full_text="# skip",
+            asset=Asset(url="https://raw/skip", file_path="docs/skip.md"),
+        )
 
         with patch.object(GitSync, "get", new=AsyncMock(return_value=sync)), patch.object(
             GitSync, "save", new=AsyncMock(return_value=None)
@@ -351,6 +401,7 @@ class TestGitSyncService:
             response = await GitSyncService.run_sync("git_sync:1")
 
         assert response.summary.created == 1
+        assert response.summary.repaired == 0
         assert response.summary.skipped == 1
         assert response.summary.failed == 0
         assert mock_resolve.await_count == 1
@@ -360,6 +411,185 @@ class TestGitSyncService:
         assert file_states["docs/skip.md"].last_status == "skipped"
         assert existing_source.title == "docs/skip.md"
         assert mock_submit.await_args.kwargs["source_title"] == "docs/new.md"
+        assert mock_submit.await_args.kwargs["file_path"] == "docs/new.md"
+
+    @pytest.mark.asyncio
+    async def test_run_sync_persists_content_before_processing(self):
+        sync = GitSync(
+            id="git_sync:persist",
+            provider="github",
+            repo="owner/repo",
+            branch="main",
+            paths=["docs/guide.md"],
+            credential_id=None,
+            notebooks=[],
+            transformations=[],
+            embed=False,
+        )
+        sync.sync_path_states()
+
+        client = AsyncMock()
+        client.fetch_text_file = AsyncMock(
+            return_value=RawFetchResult(
+                raw_url="https://raw/guide",
+                content="# Guide",
+                content_hash="hash-guide",
+            )
+        )
+        source = Source(id="source:guide", title="guide.md")
+
+        with patch.object(GitSync, "get", new=AsyncMock(return_value=sync)), patch.object(
+            GitSync, "save", new=AsyncMock(return_value=None)
+        ), patch.object(
+            GitSyncService,
+            "_get_valid_credential",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            GitSyncService, "_build_client", return_value=client
+        ), patch.object(
+            GitSyncService,
+            "_resolve_source",
+            new=AsyncMock(return_value=(source, True)),
+        ), patch.object(
+            GitSyncService,
+            "_ensure_source_notebooks",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            GitSyncService,
+            "_submit_source_processing",
+            new=AsyncMock(return_value="command:guide"),
+        ), patch(
+            "open_notebook.domain.notebook.Source.save",
+            new=AsyncMock(return_value=None),
+        ):
+            response = await GitSyncService.run_sync("git_sync:persist")
+
+        assert response.summary.created == 1
+        assert source.title == "docs/guide.md"
+        assert source.full_text == "# Guide"
+        assert source.asset is not None
+        assert source.asset.url == "https://raw/guide"
+        assert source.asset.file_path == "docs/guide.md"
+
+    @pytest.mark.asyncio
+    async def test_run_sync_repairs_empty_source_when_hash_unchanged(self):
+        sync = GitSync(
+            id="git_sync:repair",
+            provider="github",
+            repo="owner/repo",
+            branch="main",
+            paths=["docs/guide.md"],
+            credential_id=None,
+            notebooks=[],
+            transformations=[],
+            embed=False,
+            file_states=[
+                GitSyncFileState(
+                    path="docs/guide.md",
+                    source_id="source:guide",
+                    content_hash="hash-guide",
+                    active=True,
+                )
+            ],
+        )
+        sync.sync_path_states()
+
+        client = AsyncMock()
+        client.fetch_text_file = AsyncMock(
+            return_value=RawFetchResult(
+                raw_url="https://raw/guide",
+                content="# Guide",
+                content_hash="hash-guide",
+            )
+        )
+        existing_source = Source(id="source:guide", title="guide.md", full_text=None, asset=None)
+
+        with patch.object(GitSync, "get", new=AsyncMock(return_value=sync)), patch.object(
+            GitSync, "save", new=AsyncMock(return_value=None)
+        ), patch.object(
+            GitSyncService,
+            "_get_valid_credential",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            GitSyncService, "_build_client", return_value=client
+        ), patch.object(
+            GitSyncService,
+            "_ensure_source_notebooks",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            GitSyncService,
+            "_submit_source_processing",
+            new=AsyncMock(return_value="command:repair"),
+        ) as mock_submit, patch(
+            "api.git_sync_service.Source.get",
+            new=AsyncMock(return_value=existing_source),
+        ), patch(
+            "open_notebook.domain.notebook.Source.save",
+            new=AsyncMock(return_value=None),
+        ):
+            response = await GitSyncService.run_sync("git_sync:repair")
+
+        assert response.summary.created == 0
+        assert response.summary.updated == 0
+        assert response.summary.repaired == 1
+        assert response.summary.skipped == 0
+        assert existing_source.full_text == "# Guide"
+        assert existing_source.asset is not None
+        assert existing_source.asset.file_path == "docs/guide.md"
+        assert response.file_states[0].last_status == "queued"
+        assert mock_submit.await_args.kwargs["file_path"] == "docs/guide.md"
+
+    @pytest.mark.asyncio
+    async def test_run_sync_uses_confirmed_paths_without_rediscovery(self):
+        sync = GitSync(
+            id="git_sync:confirmed",
+            provider="github",
+            repo="owner/repo",
+            branch="main",
+            paths=["README.md"],
+            seed_paths=["README.md"],
+            confirmed_paths=["docs/approved.md"],
+            credential_id=None,
+            notebooks=[],
+            transformations=[],
+            embed=False,
+        )
+
+        client = AsyncMock()
+        client.fetch_text_file = AsyncMock(
+            return_value=RawFetchResult(
+                raw_url="https://raw/approved",
+                content="# Approved",
+                content_hash="hash-approved",
+            )
+        )
+
+        with patch.object(GitSync, "get", new=AsyncMock(return_value=sync)), patch.object(
+            GitSync, "save", new=AsyncMock(return_value=None)
+        ), patch.object(
+            GitSyncService,
+            "_get_valid_credential",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            GitSyncService, "_build_client", return_value=client
+        ), patch.object(
+            GitSyncService,
+            "_resolve_source",
+            new=AsyncMock(return_value=(Source(id="source:approved", title="docs/approved.md"), True)),
+        ), patch.object(
+            GitSyncService,
+            "_ensure_source_notebooks",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            GitSyncService,
+            "_submit_source_processing",
+            new=AsyncMock(return_value="command:1"),
+        ):
+            response = await GitSyncService.run_sync("git_sync:confirmed")
+
+        assert [state.path for state in response.file_states if state.active] == ["docs/approved.md"]
+        client.fetch_text_file.assert_awaited_once()
+        assert client.fetch_text_file.await_args.kwargs["path"] == "docs/approved.md"
 
     @pytest.mark.asyncio
     async def test_run_sync_records_not_found_error(self):

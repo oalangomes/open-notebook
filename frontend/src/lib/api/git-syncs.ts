@@ -11,9 +11,22 @@ export interface GitSyncFileState {
   active: boolean
 }
 
+export interface GitSyncPreviewItem {
+  path: string
+  source_type: 'explicit' | 'seed' | 'discovered'
+  discovered_from?: string | null
+  file_type?: string | null
+}
+
+export interface GitSyncPreviewResponse {
+  items: GitSyncPreviewItem[]
+  warnings: string[]
+}
+
 export interface GitSyncRunSummary {
   created: number
   updated: number
+  repaired: number
   skipped: number
   failed: number
   started_at?: string | null
@@ -29,6 +42,7 @@ export interface GitSyncResponse {
   seed_paths: string[]
   max_discovery_depth: number
   max_discovery_files: number
+  confirmed_paths: string[]
   credential_id?: string | null
   notebooks: string[]
   transformations: string[]
@@ -51,6 +65,7 @@ export interface CreateGitSyncRequest {
   seed_paths?: string[]
   max_discovery_depth?: number
   max_discovery_files?: number
+  confirmed_paths?: string[]
   credential_id?: string
   notebooks: string[]
   transformations: string[]
@@ -65,6 +80,11 @@ export interface GitSyncRunResponse {
 }
 
 export const gitSyncsApi = {
+  preview: async (data: CreateGitSyncRequest): Promise<GitSyncPreviewResponse> => {
+    const response = await apiClient.post<GitSyncPreviewResponse>('/git-syncs/preview', data)
+    return response.data
+  },
+
   create: async (data: CreateGitSyncRequest): Promise<GitSyncResponse> => {
     const response = await apiClient.post<GitSyncResponse>('/git-syncs', data)
     return response.data

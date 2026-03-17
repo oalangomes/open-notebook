@@ -19,6 +19,8 @@ from surreal_commands import execute_command_sync, submit_command
 from api.command_service import CommandService
 from api.models import (
     AssetModel,
+    BulkDeleteSourcesRequest,
+    BulkDeleteSourcesResponse,
     CreateSourceInsightRequest,
     InsightCreationResponse,
     SourceCreate,
@@ -933,6 +935,36 @@ async def delete_source(source_id: str):
     except Exception as e:
         logger.error(f"Error deleting source {source_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error deleting source: {str(e)}")
+
+
+@router.post("/sources/bulk-delete", response_model=BulkDeleteSourcesResponse)
+async def bulk_delete_sources(request: BulkDeleteSourcesRequest):
+    """Delete multiple sources in a single request."""
+    deleted_ids: List[str] = []
+    not_found_ids: List[str] = []
+    failed_ids: List[str] = []
+
+    for source_id in request.source_ids:
+        try:
+            source = await Source.get(source_id)
+            if not source:
+                not_found_ids.append(source_id)
+                continue
+
+            await source.delete()
+            deleted_ids.append(source_id)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error deleting source {source_id} in bulk operation: {str(e)}")
+            failed_ids.append(source_id)
+
+    return BulkDeleteSourcesResponse(
+        message="Bulk source deletion completed",
+        deleted_ids=deleted_ids,
+        not_found_ids=not_found_ids,
+        failed_ids=failed_ids,
+    )
 
 
 @router.get("/sources/{source_id}/insights", response_model=List[SourceInsightResponse])

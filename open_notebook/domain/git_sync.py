@@ -28,6 +28,7 @@ class GitSyncFileState(BaseModel):
 class GitSyncRunSummary(BaseModel):
     created: int = 0
     updated: int = 0
+    repaired: int = 0
     skipped: int = 0
     failed: int = 0
     started_at: Optional[datetime] = None
@@ -52,6 +53,7 @@ class GitSync(ObjectModel):
     seed_paths: List[str] = Field(default_factory=list)
     max_discovery_depth: int = 2
     max_discovery_files: int = 200
+    confirmed_paths: List[str] = Field(default_factory=list)
     credential_id: Optional[str] = None
     notebooks: List[str] = Field(default_factory=list)
     transformations: List[str] = Field(default_factory=list)
@@ -79,7 +81,7 @@ class GitSync(ObjectModel):
         cleaned = value.strip()
         return cleaned or None
 
-    @field_validator("paths", "seed_paths", mode="before")
+    @field_validator("paths", "seed_paths", "confirmed_paths", mode="before")
     @classmethod
     def normalize_paths(cls, value: List[str]) -> List[str]:
         normalized = []

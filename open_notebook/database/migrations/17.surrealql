@@ -1,0 +1,4 @@
+-- Migration 17: Persist confirmed repository paths for git sync approval flow
+
+DEFINE FIELD confirmed_paths ON git_sync TYPE array DEFAULT [];
+DEFINE FIELD confirmed_paths.* ON git_sync TYPE string;

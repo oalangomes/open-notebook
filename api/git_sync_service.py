@@ -1,6 +1,7 @@
 import posixpath
 import re
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import List, Optional
@@ -21,6 +22,8 @@ from api.git_raw_client import (
 from api.models import (
     GitSyncCreateRequest,
     GitSyncFileStateResponse,
+    GitSyncPreviewItemResponse,
+    GitSyncPreviewResponse,
     GitSyncResponse,
     GitSyncRunResponse,
     GitSyncRunSummaryResponse,
@@ -31,8 +34,15 @@ from commands.source_commands import SourceProcessingInput
 from open_notebook.database.repository import ensure_record_id, repo_query
 from open_notebook.domain.credential import Credential
 from open_notebook.domain.git_sync import GitSync, GitSyncFileState, GitSyncRunSummary
-from open_notebook.domain.notebook import Notebook, Source
+from open_notebook.domain.notebook import Asset, Notebook, Source
 from open_notebook.domain.transformation import Transformation
+
+
+@dataclass
+class GitDiscoveredPath:
+    path: str
+    source_type: str
+    discovered_from: Optional[str] = None
 
 
 class GitSyncService:
@@ -53,12 +63,52 @@ class GitSyncService:
         return GitSyncService.to_response(sync)
 
     @staticmethod
+    async def preview_sync(request: GitSyncCreateRequest) -> GitSyncPreviewResponse:
+        await GitSyncService._validate_discovery_config(
+            provider=request.provider,
+            repo=request.repo,
+            paths=request.paths,
+            seed_paths=request.seed_paths,
+            credential_id=request.credential_id,
+            require_access_validation=True,
+        )
+        credential = await GitSyncService._get_valid_credential(
+            provider=request.provider,
+            credential_id=request.credential_id,
+            repo=request.repo,
+            require_access_validation=True,
+        )
+        client = GitSyncService._build_client(request.provider, credential)
+        items, warnings = await GitSyncService._discover_paths(
+            repo=request.repo,
+            branch=request.branch,
+            paths=request.paths,
+            seed_paths=request.seed_paths,
+            max_discovery_depth=request.max_discovery_depth,
+            max_discovery_files=request.max_discovery_files,
+            client=client,
+        )
+        return GitSyncPreviewResponse(
+            items=[
+                GitSyncPreviewItemResponse(
+                    path=item.path,
+                    source_type=item.source_type,
+                    discovered_from=item.discovered_from,
+                    file_type=GitSyncService._build_file_type(item.path),
+                )
+                for item in items
+            ],
+            warnings=warnings,
+        )
+
+    @staticmethod
     async def create_sync(request: GitSyncCreateRequest) -> GitSyncResponse:
         await GitSyncService._validate_config(
             provider=request.provider,
             repo=request.repo,
             paths=request.paths,
             seed_paths=request.seed_paths,
+            confirmed_paths=request.confirmed_paths,
             credential_id=request.credential_id,
             notebooks=request.notebooks,
             transformations=request.transformations,
@@ -72,6 +122,7 @@ class GitSyncService:
             seed_paths=request.seed_paths,
             max_discovery_depth=request.max_discovery_depth,
             max_discovery_files=request.max_discovery_files,
+            confirmed_paths=request.confirmed_paths,
             credential_id=request.credential_id,
             notebooks=request.notebooks,
             transformations=request.transformations,
@@ -102,6 +153,11 @@ class GitSyncService:
             seed_paths=(
                 request.seed_paths if request.seed_paths is not None else sync.seed_paths
             ),
+            confirmed_paths=(
+                request.confirmed_paths
+                if request.confirmed_paths is not None
+                else sync.confirmed_paths
+            ),
             credential_id=credential_id,
             notebooks=notebooks,
             transformations=transformations,
@@ -117,6 +173,8 @@ class GitSyncService:
             sync.max_discovery_depth = request.max_discovery_depth
         if request.max_discovery_files is not None:
             sync.max_discovery_files = request.max_discovery_files
+        if request.confirmed_paths is not None:
+            sync.confirmed_paths = request.confirmed_paths
         if request.credential_id is not None:
             sync.credential_id = request.credential_id
         if request.notebooks is not None:
@@ -141,7 +199,17 @@ class GitSyncService:
             repo=sync.repo,
         )
         client = GitSyncService._build_client(sync.provider, credential)
-        effective_paths = await GitSyncService._resolve_sync_paths(sync, client)
+        if sync.confirmed_paths:
+            effective_paths = [
+                path
+                for path in (
+                    GitSyncService._normalize_repo_path(path)
+                    for path in sync.confirmed_paths
+                )
+                if path
+            ]
+        else:
+            effective_paths = await GitSyncService._resolve_sync_paths(sync, client)
         sync.sync_path_states(effective_paths)
 
         summary = GitSyncRunSummary(started_at=datetime.now(timezone.utc))
@@ -158,33 +226,76 @@ class GitSyncService:
                     path=path,
                 )
                 state.raw_url = fetch_result.raw_url
+                source_title = GitSyncService._build_source_title(path)
 
                 if state.content_hash == fetch_result.content_hash and state.source_id:
                     try:
                         existing_source = await Source.get(state.source_id)
-                        await GitSyncService._ensure_source_title(
-                            existing_source,
-                            GitSyncService._build_source_title(path),
-                        )
-                        summary.skipped += 1
-                        state.last_sync = file_sync_time
-                        state.last_status = "skipped"
-                        state.last_error = None
-                        continue
                     except Exception:
                         logger.warning(
                             f"Source {state.source_id} missing for sync {sync.id} path={path}. "
                             "Recreating source record."
                         )
+                    else:
+                        if not GitSyncService._source_needs_repair(
+                            existing_source,
+                            path=path,
+                            raw_url=fetch_result.raw_url,
+                        ):
+                            await GitSyncService._ensure_source_title(
+                                existing_source,
+                                source_title,
+                            )
+                            summary.skipped += 1
+                            state.last_sync = file_sync_time
+                            state.last_status = "skipped"
+                            state.last_error = None
+                            continue
+
+                        await GitSyncService._persist_source_content(
+                            source=existing_source,
+                            path=path,
+                            raw_url=fetch_result.raw_url,
+                            content=fetch_result.content,
+                        )
+                        await GitSyncService._ensure_source_notebooks(
+                            existing_source,
+                            sync.notebooks,
+                        )
+                        command_id = await GitSyncService._submit_source_processing(
+                            source=existing_source,
+                            sync=sync,
+                            content=fetch_result.content,
+                            raw_url=fetch_result.raw_url,
+                            source_title=source_title,
+                            file_path=path,
+                        )
+                        state.source_id = existing_source.id
+                        state.content_hash = fetch_result.content_hash
+                        state.last_sync = file_sync_time
+                        state.last_status = "queued"
+                        state.last_error = None
+                        summary.repaired += 1
+                        logger.info(
+                            f"Queued git sync repair for {sync.id} path={path} command={command_id}"
+                        )
+                        continue
 
                 source, created = await GitSyncService._resolve_source(sync, state)
+                await GitSyncService._persist_source_content(
+                    source=source,
+                    path=path,
+                    raw_url=fetch_result.raw_url,
+                    content=fetch_result.content,
+                )
                 await GitSyncService._ensure_source_notebooks(source, sync.notebooks)
                 command_id = await GitSyncService._submit_source_processing(
                     source=source,
                     sync=sync,
                     content=fetch_result.content,
                     raw_url=fetch_result.raw_url,
-                    source_title=GitSyncService._build_source_title(path),
+                    source_title=source_title,
+                    file_path=path,
                 )
 
                 state.source_id = source.id
@@ -233,25 +344,55 @@ class GitSyncService:
 
     @staticmethod
     async def _resolve_sync_paths(sync: GitSync, client: GitRawClient) -> List[str]:
-        ordered_paths: dict[str, None] = {}
+        items, _ = await GitSyncService._discover_paths(
+            repo=sync.repo,
+            branch=sync.branch,
+            paths=sync.paths,
+            seed_paths=sync.seed_paths,
+            max_discovery_depth=sync.max_discovery_depth,
+            max_discovery_files=sync.max_discovery_files,
+            client=client,
+            sync_id=sync.id,
+        )
+        return [item.path for item in items]
 
-        for path in sync.paths:
+    @staticmethod
+    async def _discover_paths(
+        repo: str,
+        branch: str,
+        paths: List[str],
+        seed_paths: List[str],
+        max_discovery_depth: int,
+        max_discovery_files: int,
+        client: GitRawClient,
+        sync_id: Optional[str] = None,
+    ) -> tuple[List[GitDiscoveredPath], List[str]]:
+        ordered_paths: dict[str, GitDiscoveredPath] = {}
+        warnings: List[str] = []
+
+        for path in paths:
             normalized = GitSyncService._normalize_repo_path(path)
             if normalized:
-                ordered_paths[normalized] = None
+                GitSyncService._register_discovered_path(
+                    ordered_paths,
+                    GitDiscoveredPath(path=normalized, source_type="explicit"),
+                )
 
         markdown_queue: deque[tuple[str, int]] = deque()
         visited_markdown: set[str] = set()
 
-        for seed_path in sync.seed_paths:
+        for seed_path in seed_paths:
             normalized_seed = GitSyncService._normalize_repo_path(seed_path)
             if not normalized_seed:
                 continue
-            ordered_paths[normalized_seed] = None
+            GitSyncService._register_discovered_path(
+                ordered_paths,
+                GitDiscoveredPath(path=normalized_seed, source_type="seed"),
+            )
             if GitSyncService._is_markdown_path(normalized_seed):
                 markdown_queue.append((normalized_seed, 0))
 
-        while markdown_queue and len(ordered_paths) < sync.max_discovery_files:
+        while markdown_queue and len(ordered_paths) < max_discovery_files:
             current_path, depth = markdown_queue.popleft()
             if current_path in visited_markdown:
                 continue
@@ -260,14 +401,18 @@ class GitSyncService:
 
             try:
                 fetch_result = await client.fetch_text_file(
-                    repo=sync.repo,
-                    branch=sync.branch,
+                    repo=repo,
+                    branch=branch,
                     path=current_path,
                 )
             except (GitRawAuthError, GitRawNotFoundError, GitRawClientError) as exc:
-                logger.warning(
-                    f"Skipping discovery expansion for {sync.id} path={current_path}: {exc}"
+                warning = (
+                    f"Skipping discovery expansion for {current_path}: {exc}"
+                    if sync_id is None
+                    else f"Skipping discovery expansion for {sync_id} path={current_path}: {exc}"
                 )
+                warnings.append(warning)
+                logger.warning(warning)
                 continue
 
             for linked_path in GitSyncService._extract_discoverable_links(
@@ -276,22 +421,52 @@ class GitSyncService:
             ):
                 if linked_path in ordered_paths:
                     continue
-                if len(ordered_paths) >= sync.max_discovery_files:
-                    logger.warning(
-                        f"Discovery file limit reached for sync {sync.id} "
-                        f"(max_discovery_files={sync.max_discovery_files})"
+                if len(ordered_paths) >= max_discovery_files:
+                    warning = (
+                        f"Discovery file limit reached (max_discovery_files={max_discovery_files})"
+                        if sync_id is None
+                        else f"Discovery file limit reached for sync {sync_id} (max_discovery_files={max_discovery_files})"
                     )
+                    warnings.append(warning)
+                    logger.warning(warning)
                     break
 
-                ordered_paths[linked_path] = None
+                GitSyncService._register_discovered_path(
+                    ordered_paths,
+                    GitDiscoveredPath(
+                        path=linked_path,
+                        source_type="discovered",
+                        discovered_from=current_path,
+                    ),
+                )
 
-                if (
-                    depth < sync.max_discovery_depth
-                    and GitSyncService._is_markdown_path(linked_path)
+                if depth < max_discovery_depth and GitSyncService._is_markdown_path(
+                    linked_path
                 ):
                     markdown_queue.append((linked_path, depth + 1))
 
-        return list(ordered_paths.keys())
+        return list(ordered_paths.values()), warnings
+
+    @staticmethod
+    def _register_discovered_path(
+        registry: dict[str, GitDiscoveredPath], item: GitDiscoveredPath
+    ) -> None:
+        existing = registry.get(item.path)
+        if existing is None:
+            registry[item.path] = item
+            return
+
+        precedence = {"explicit": 3, "seed": 2, "discovered": 1}
+        if precedence[item.source_type] > precedence[existing.source_type]:
+            registry[item.path] = GitDiscoveredPath(
+                path=item.path,
+                source_type=item.source_type,
+                discovered_from=item.discovered_from or existing.discovered_from,
+            )
+            return
+
+        if existing.discovered_from is None and item.discovered_from is not None:
+            existing.discovered_from = item.discovered_from
 
     @staticmethod
     def _extract_discoverable_links(
@@ -359,6 +534,11 @@ class GitSyncService:
         return normalized.replace("\\", "/")
 
     @staticmethod
+    def _build_file_type(path: str) -> Optional[str]:
+        suffix = PurePosixPath(path).suffix.lower().lstrip(".")
+        return suffix or None
+
+    @staticmethod
     def _is_markdown_path(path: str) -> bool:
         return PurePosixPath(path).suffix.lower() in GitSyncService.MARKDOWN_EXTENSIONS
 
@@ -367,14 +547,13 @@ class GitSyncService:
         return PurePosixPath(path).suffix.lower() in GitSyncService.DISCOVERABLE_EXTENSIONS
 
     @staticmethod
-    async def _validate_config(
+    async def _validate_discovery_config(
         provider: str,
         repo: str,
         paths: List[str],
         seed_paths: List[str],
         credential_id: Optional[str],
-        notebooks: List[str],
-        transformations: List[str],
+        require_access_validation: bool = False,
     ) -> None:
         if provider not in GitSyncService.SUPPORTED_PROVIDERS:
             raise HTTPException(status_code=400, detail=f"Unsupported Git provider: {provider}")
@@ -388,8 +567,38 @@ class GitSyncService:
             provider=provider,
             credential_id=credential_id,
             repo=repo,
+            require_access_validation=require_access_validation,
+        )
+
+    @staticmethod
+    async def _validate_config(
+        provider: str,
+        repo: str,
+        paths: List[str],
+        seed_paths: List[str],
+        confirmed_paths: List[str],
+        credential_id: Optional[str],
+        notebooks: List[str],
+        transformations: List[str],
+    ) -> None:
+        await GitSyncService._validate_discovery_config(
+            provider=provider,
+            repo=repo,
+            paths=paths,
+            seed_paths=seed_paths,
+            credential_id=credential_id,
             require_access_validation=True,
         )
+
+        if confirmed_paths:
+            invalid_confirmed_paths = [
+                path for path in confirmed_paths if not GitSyncService._normalize_repo_path(path)
+            ]
+            if invalid_confirmed_paths:
+                raise HTTPException(
+                    status_code=400,
+                    detail="confirmed_paths contains invalid repository paths",
+                )
 
         for notebook_id in notebooks:
             try:
@@ -518,6 +727,49 @@ class GitSyncService:
         await source.save()
 
     @staticmethod
+    def _source_needs_repair(source: Source, path: str, raw_url: str) -> bool:
+        normalized_path = GitSyncService._normalize_repo_path(path) or path
+        if not isinstance(source.full_text, str) or not source.full_text.strip():
+            return True
+        if source.asset is None:
+            return True
+        return source.asset.url != raw_url or source.asset.file_path != normalized_path
+
+    @staticmethod
+    async def _persist_source_content(
+        source: Source,
+        path: str,
+        raw_url: str,
+        content: str,
+    ) -> None:
+        normalized_path = GitSyncService._normalize_repo_path(path) or path
+        source_title = GitSyncService._build_source_title(path)
+        new_asset = Asset(url=raw_url, file_path=normalized_path)
+
+        should_save = False
+
+        if source.title != source_title:
+            source.title = source_title
+            should_save = True
+
+        if source.full_text != content:
+            source.full_text = content
+            should_save = True
+
+        if source.asset is None:
+            source.asset = new_asset
+            should_save = True
+        elif (
+            source.asset.url != new_asset.url
+            or source.asset.file_path != new_asset.file_path
+        ):
+            source.asset = new_asset
+            should_save = True
+
+        if should_save:
+            await source.save()
+
+    @staticmethod
     def _build_source_title(path: str) -> str:
         normalized_path = GitSyncService._normalize_repo_path(path)
         return normalized_path or PurePosixPath(path).name
@@ -539,13 +791,23 @@ class GitSyncService:
 
     @staticmethod
     async def _submit_source_processing(
-        source: Source, sync: GitSync, content: str, raw_url: str, source_title: str
+        source: Source,
+        sync: GitSync,
+        content: str,
+        raw_url: str,
+        source_title: str,
+        file_path: str,
     ) -> str:
         import commands.source_commands  # noqa: F401
 
         command_input = SourceProcessingInput(
             source_id=str(source.id),
-            content_state={"content": content, "url": raw_url, "title": source_title},
+            content_state={
+                "content": content,
+                "url": raw_url,
+                "file_path": GitSyncService._normalize_repo_path(file_path) or file_path,
+                "title": source_title,
+            },
             notebook_ids=sync.notebooks,
             transformations=sync.transformations,
             embed=sync.embed,
@@ -570,6 +832,7 @@ class GitSyncService:
             seed_paths=sync.seed_paths,
             max_discovery_depth=sync.max_discovery_depth,
             max_discovery_files=sync.max_discovery_files,
+            confirmed_paths=sync.confirmed_paths,
             credential_id=sync.credential_id,
             notebooks=sync.notebooks,
             transformations=sync.transformations,
@@ -596,6 +859,7 @@ class GitSyncService:
         return GitSyncRunSummaryResponse(
             created=summary.created,
             updated=summary.updated,
+            repaired=summary.repaired,
             skipped=summary.skipped,
             failed=summary.failed,
             started_at=summary.started_at.isoformat() if summary.started_at else None,

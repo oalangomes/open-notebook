@@ -1,0 +1,3 @@
+-- Rollback Migration 17: Remove confirmed repository paths from git sync
+
+REMOVE FIELD confirmed_paths ON git_sync;

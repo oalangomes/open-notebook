@@ -679,10 +679,23 @@ class GitSyncFileStateResponse(BaseModel):
 class GitSyncRunSummaryResponse(BaseModel):
     created: int = 0
     updated: int = 0
+    repaired: int = 0
     skipped: int = 0
     failed: int = 0
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
+
+
+class GitSyncPreviewItemResponse(BaseModel):
+    path: str
+    source_type: Literal["explicit", "seed", "discovered"]
+    discovered_from: Optional[str] = None
+    file_type: Optional[str] = None
+
+
+class GitSyncPreviewResponse(BaseModel):
+    items: List[GitSyncPreviewItemResponse] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
 
 
 def normalize_github_repo_input(value: str) -> str:
@@ -737,6 +750,10 @@ class GitSyncCreateRequest(BaseModel):
     max_discovery_files: int = Field(
         200, description="Maximum number of discovered files per sync", ge=1, le=5000
     )
+    confirmed_paths: List[str] = Field(
+        default_factory=list,
+        description="User-approved repository file paths to process",
+    )
     credential_id: Optional[str] = Field(
         None, description="Credential ID with PAT access"
     )
@@ -759,7 +776,7 @@ class GitSyncCreateRequest(BaseModel):
         value = v.strip()
         return value or None
 
-    @field_validator("paths", "seed_paths", mode="before")
+    @field_validator("paths", "seed_paths", "confirmed_paths", mode="before")
     @classmethod
     def normalize_paths(cls, v):
         if v is None:
@@ -804,6 +821,9 @@ class GitSyncUpdateRequest(BaseModel):
     max_discovery_files: Optional[int] = Field(
         None, description="Maximum number of discovered files per sync", ge=1, le=5000
     )
+    confirmed_paths: Optional[List[str]] = Field(
+        None, description="User-approved repository file paths to process"
+    )
     credential_id: Optional[str] = Field(
         None, description="Credential ID with PAT access"
     )
@@ -826,7 +846,7 @@ class GitSyncUpdateRequest(BaseModel):
         value = v.strip()
         return value or None
 
-    @field_validator("paths", "seed_paths", mode="before")
+    @field_validator("paths", "seed_paths", "confirmed_paths", mode="before")
     @classmethod
     def normalize_update_paths(cls, v):
         if v is None:
@@ -851,6 +871,7 @@ class GitSyncResponse(BaseModel):
     seed_paths: List[str]
     max_discovery_depth: int
     max_discovery_files: int
+    confirmed_paths: List[str]
     credential_id: Optional[str] = None
     notebooks: List[str]
     transformations: List[str]
@@ -869,6 +890,34 @@ class GitSyncRunResponse(BaseModel):
     sync_id: str
     summary: GitSyncRunSummaryResponse
     file_states: List[GitSyncFileStateResponse] = Field(default_factory=list)
+
+
+class BulkDeleteSourcesRequest(BaseModel):
+    source_ids: List[str] = Field(
+        ..., min_length=1, description="List of source IDs to delete"
+    )
+
+    @field_validator("source_ids", mode="before")
+    @classmethod
+    def normalize_source_ids(cls, value):
+        normalized = []
+        for item in value or []:
+            if not isinstance(item, str):
+                raise ValueError("Each source ID must be a string")
+            cleaned = item.strip()
+            if not cleaned:
+                raise ValueError("Source IDs cannot contain empty values")
+            normalized.append(cleaned)
+        if not normalized:
+            raise ValueError("At least one source ID must be provided")
+        return list(dict.fromkeys(normalized))
+
+
+class BulkDeleteSourcesResponse(BaseModel):
+    message: str
+    deleted_ids: List[str] = Field(default_factory=list)
+    not_found_ids: List[str] = Field(default_factory=list)
+    failed_ids: List[str] = Field(default_factory=list)
 
 
 class NotebookDeletePreview(BaseModel):

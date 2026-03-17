@@ -75,6 +75,18 @@ export const sourcesApi = {
     await apiClient.delete(`/sources/${id}`)
   },
 
+  bulkDelete: async (sourceIds: string[]) => {
+    const response = await apiClient.post<{
+      message: string
+      deleted_ids: string[]
+      not_found_ids: string[]
+      failed_ids: string[]
+    }>('/sources/bulk-delete', {
+      source_ids: sourceIds,
+    })
+    return response.data
+  },
+
   status: async (id: string) => {
     const response = await apiClient.get<SourceStatusResponse>(`/sources/${id}/status`)
     return response.data

@@ -6,6 +6,7 @@ from loguru import logger
 from api.git_sync_service import GitSyncService
 from api.models import (
     GitSyncCreateRequest,
+    GitSyncPreviewResponse,
     GitSyncResponse,
     GitSyncRunResponse,
     GitSyncUpdateRequest,
@@ -34,6 +35,17 @@ async def create_git_sync(request: GitSyncCreateRequest):
     except Exception as e:
         logger.error(f"Error creating git sync: {e}")
         raise HTTPException(status_code=500, detail="Failed to create git sync")
+
+
+@router.post("/preview", response_model=GitSyncPreviewResponse)
+async def preview_git_sync(request: GitSyncCreateRequest):
+    try:
+        return await GitSyncService.preview_sync(request)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error previewing git sync: {e}")
+        raise HTTPException(status_code=500, detail="Failed to preview git sync")
 
 
 @router.get("/{sync_id}", response_model=GitSyncResponse)

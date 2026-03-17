@@ -12,6 +12,7 @@ import { FileText, Link as LinkIcon, Upload, AlignLeft, Trash2, ArrowUpDown } fr
 import { formatDistanceToNow } from 'date-fns'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { useTranslation } from '@/lib/hooks/use-translation'
 import { getDateLocale } from '@/lib/utils/date-locale'
 import { cn } from '@/lib/utils'
@@ -27,9 +28,16 @@ export default function SourcesPage() {
   const [selectedIndex, setSelectedIndex] = useState(0)
   const [sortBy, setSortBy] = useState<'created' | 'updated'>('updated')
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc')
-  const [deleteDialog, setDeleteDialog] = useState<{ open: boolean; source: SourceListResponse | null }>({
+  const [selectedSourceIds, setSelectedSourceIds] = useState<string[]>([])
+  const [isDeleting, setIsDeleting] = useState(false)
+  const [deleteDialog, setDeleteDialog] = useState<{
+    open: boolean
+    source: SourceListResponse | null
+    bulk: boolean
+  }>({
     open: false,
-    source: null
+    source: null,
+    bulk: false,
   })
   const router = useRouter()
   const tableRef = useRef<HTMLTableElement>(null)
@@ -50,6 +58,7 @@ export default function SourcesPage() {
         setLoading(true)
         offsetRef.current = 0
         setSources([])
+        setSelectedSourceIds([])
         hasMoreRef.current = true
       } else {
         loadingMoreRef.current = true
@@ -232,22 +241,64 @@ export default function SourcesPage() {
 
   const handleDeleteClick = useCallback((e: React.MouseEvent, source: SourceListResponse) => {
     e.stopPropagation() // Prevent row click
-    setDeleteDialog({ open: true, source })
+    setDeleteDialog({ open: true, source, bulk: false })
   }, [])
 
+  const handleSourceSelectionToggle = useCallback((sourceId: string) => {
+    setSelectedSourceIds(prev => (
+      prev.includes(sourceId)
+        ? prev.filter(id => id !== sourceId)
+        : [...prev, sourceId]
+    ))
+  }, [])
+
+  const handleToggleSelectAll = useCallback(() => {
+    setSelectedSourceIds(prev => (
+      prev.length === sources.length ? [] : sources.map(source => source.id)
+    ))
+  }, [sources])
+
+  const handleBulkDeleteClick = useCallback(() => {
+    if (selectedSourceIds.length === 0) return
+    setDeleteDialog({ open: true, source: null, bulk: true })
+  }, [selectedSourceIds.length])
+
   const handleDeleteConfirm = async () => {
-    if (!deleteDialog.source) return
+    setIsDeleting(true)
 
     try {
-      await sourcesApi.delete(deleteDialog.source.id)
-      toast.success(t.sources.deleteSuccess)
-      // Remove the deleted source from the list
-      setSources(prev => prev.filter(s => s.id !== deleteDialog.source?.id))
-      setDeleteDialog({ open: false, source: null })
+      if (deleteDialog.bulk) {
+        const result = await sourcesApi.bulkDelete(selectedSourceIds)
+        setSources(prev => prev.filter(source => !result.deleted_ids.includes(source.id)))
+        setSelectedSourceIds([])
+
+        if (result.failed_ids.length > 0 || result.not_found_ids.length > 0) {
+          toast.warning(
+            language === 'pt-BR'
+              ? `Exclusão em lote concluída com ressalvas: ${result.deleted_ids.length} removida(s), ${result.not_found_ids.length} não encontrada(s), ${result.failed_ids.length} com falha.`
+              : `Bulk delete completed with warnings: ${result.deleted_ids.length} deleted, ${result.not_found_ids.length} not found, ${result.failed_ids.length} failed.`
+          )
+        } else {
+          toast.success(
+            language === 'pt-BR'
+              ? `${result.deleted_ids.length} fonte(s) removida(s) com sucesso.`
+              : `${result.deleted_ids.length} source(s) deleted successfully.`
+          )
+        }
+      } else if (deleteDialog.source) {
+        await sourcesApi.delete(deleteDialog.source.id)
+        toast.success(t.sources.deleteSuccess)
+        setSources(prev => prev.filter(s => s.id !== deleteDialog.source?.id))
+        setSelectedSourceIds(prev => prev.filter(id => id !== deleteDialog.source?.id))
+      }
+
+      setDeleteDialog({ open: false, source: null, bulk: false })
     } catch (err: unknown) {
       const error = err as { response?: { data?: { detail?: string } }, message?: string };
       console.error('Failed to delete source:', error)
       toast.error(t(getApiErrorKey(error.response?.data?.detail || error.message)))
+    } finally {
+      setIsDeleting(false)
     }
   }
 
@@ -283,6 +334,9 @@ export default function SourcesPage() {
     )
   }
 
+  const allVisibleSelected = sources.length > 0 && selectedSourceIds.length === sources.length
+  const partiallySelected = selectedSourceIds.length > 0 && !allVisibleSelected
+
   return (
     <AppShell>
       <div className="flex flex-col h-full w-full max-w-none px-6 py-6">
@@ -293,6 +347,39 @@ export default function SourcesPage() {
           </p>
         </div>
 
+        <div className="mb-4 flex items-center justify-between rounded-md border bg-muted/30 px-4 py-3">
+          <div className="flex items-center gap-3">
+            <Checkbox
+              checked={allVisibleSelected ? true : partiallySelected ? 'indeterminate' : false}
+              onCheckedChange={handleToggleSelectAll}
+              aria-label={language === 'pt-BR' ? 'Selecionar todas as fontes visíveis' : 'Select all visible sources'}
+            />
+            <span className="text-sm text-muted-foreground">
+              {selectedSourceIds.length > 0
+                ? (
+                  language === 'pt-BR'
+                    ? `${selectedSourceIds.length} fonte(s) selecionada(s)`
+                    : `${selectedSourceIds.length} source(s) selected`
+                )
+                : (
+                  language === 'pt-BR'
+                    ? 'Selecione várias fontes para apagar em lote'
+                    : 'Select multiple sources to delete in bulk'
+                )}
+            </span>
+          </div>
+
+          <Button
+            type="button"
+            variant="destructive"
+            onClick={handleBulkDeleteClick}
+            disabled={selectedSourceIds.length === 0}
+          >
+            <Trash2 className="mr-2 h-4 w-4" />
+            {language === 'pt-BR' ? 'Apagar selecionadas' : 'Delete selected'}
+          </Button>
+        </div>
+
         <div ref={scrollContainerRef} className="flex-1 rounded-md border overflow-auto">
           <table
             ref={tableRef}
@@ -300,6 +387,7 @@ export default function SourcesPage() {
             className="w-full min-w-[800px] outline-none table-fixed"
           >
             <colgroup>
+              <col className="w-[56px]" />
               <col className="w-[120px]" />
               <col className="w-auto" />
               <col className="w-[140px]" />
@@ -309,6 +397,13 @@ export default function SourcesPage() {
             </colgroup>
             <thead className="sticky top-0 bg-background z-10">
               <tr className="border-b bg-muted/50">
+                <th className="h-12 px-4 text-center align-middle font-medium text-muted-foreground">
+                  <Checkbox
+                    checked={allVisibleSelected ? true : partiallySelected ? 'indeterminate' : false}
+                    onCheckedChange={handleToggleSelectAll}
+                    aria-label={language === 'pt-BR' ? 'Selecionar todas as fontes visíveis' : 'Select all visible sources'}
+                  />
+                </th>
                 <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">
                   {t.common.type}
                 </th>
@@ -358,6 +453,14 @@ export default function SourcesPage() {
                       : "hover:bg-muted/50"
                   )}
                 >
+                  <td className="h-12 px-4 text-center">
+                    <Checkbox
+                      checked={selectedSourceIds.includes(source.id)}
+                      onCheckedChange={() => handleSourceSelectionToggle(source.id)}
+                      aria-label={language === 'pt-BR' ? `Selecionar ${source.title || t.sources.untitledSource}` : `Select ${source.title || t.sources.untitledSource}`}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </td>
                   <td className="h-12 px-4">
                     <div className="flex items-center gap-2">
                       {getSourceIcon(source)}
@@ -406,7 +509,7 @@ export default function SourcesPage() {
               ))}
               {loadingMore && (
                 <tr>
-                  <td colSpan={6} className="h-16 text-center">
+                  <td colSpan={7} className="h-16 text-center">
                     <div className="flex items-center justify-center">
                       <LoadingSpinner />
                       <span className="ml-2 text-muted-foreground">{t.sources.loadingMore}</span>
@@ -421,12 +524,21 @@ export default function SourcesPage() {
 
       <ConfirmDialog
         open={deleteDialog.open}
-        onOpenChange={(open) => setDeleteDialog({ open, source: deleteDialog.source })}
-        title={t.sources.delete}
-        description={t.sources.deleteConfirmWithTitle.replace('{title}', deleteDialog.source?.title || t.sources.untitledSource)}
+        onOpenChange={(open) => setDeleteDialog({ open, source: deleteDialog.source, bulk: deleteDialog.bulk })}
+        title={deleteDialog.bulk ? (language === 'pt-BR' ? 'Apagar fontes selecionadas' : 'Delete selected sources') : t.sources.delete}
+        description={
+          deleteDialog.bulk
+            ? (
+              language === 'pt-BR'
+                ? `Tem certeza que deseja apagar ${selectedSourceIds.length} fonte(s)?`
+                : `Are you sure you want to delete ${selectedSourceIds.length} source(s)?`
+            )
+            : t.sources.deleteConfirmWithTitle.replace('{title}', deleteDialog.source?.title || t.sources.untitledSource)
+        }
         confirmText={t.common.delete}
         confirmVariant="destructive"
         onConfirm={handleDeleteConfirm}
+        isLoading={isDeleting}
       />
     </AppShell>
   )

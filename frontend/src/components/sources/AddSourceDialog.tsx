@@ -16,16 +16,18 @@ import {
 import { Button } from '@/components/ui/button'
 import { WizardContainer, WizardStep } from '@/components/ui/wizard-container'
 import { SourceTypeStep, parseAndValidateUrls } from './steps/SourceTypeStep'
+import { GitSourcePreviewStep } from './steps/GitSourcePreviewStep'
 import { NotebooksStep } from './steps/NotebooksStep'
 import { ProcessingStep } from './steps/ProcessingStep'
 import { useNotebooks } from '@/lib/hooks/use-notebooks'
 import { useTransformations } from '@/lib/hooks/use-transformations'
 import { useCreateSource } from '@/lib/hooks/use-sources'
-import { useCreateGitSyncSource } from '@/lib/hooks/use-git-syncs'
+import { useCreateGitSyncSource, usePreviewGitSyncSource } from '@/lib/hooks/use-git-syncs'
 import { useSettings } from '@/lib/hooks/use-settings'
 import { CreateSourceRequest } from '@/lib/types/api'
 import { useTranslation } from '@/lib/hooks/use-translation'
 import { useCreateCredential, useCredentialsByProvider } from '@/lib/hooks/use-credentials'
+import { GitSyncPreviewItem } from '@/lib/api/git-syncs'
 
 const MAX_BATCH_SIZE = 50
 
@@ -113,6 +115,8 @@ interface GitCredentialFormState {
   apiKey: string
 }
 
+type WizardStepKey = 'source' | 'preview' | 'notebooks' | 'processing'
+
 function normalizeGitHubRepoInput(value: string): string {
   const trimmed = value.trim()
   if (!trimmed) {
@@ -163,12 +167,6 @@ export function AddSourceDialog({
   const { t, language } = useTranslation()
   const isPortuguese = language === 'pt-BR'
 
-  const WIZARD_STEPS: readonly WizardStep[] = [
-    { number: 1, title: t.sources.addSource, description: t.sources.processDescription },
-    { number: 2, title: t.navigation.notebooks, description: t.notebooks.searchPlaceholder },
-    { number: 3, title: t.navigation.process, description: t.sources.processDescription },
-  ]
-
   // Simplified state management
   const [currentStep, setCurrentStep] = useState(1)
   const [processing, setProcessing] = useState(false)
@@ -181,6 +179,9 @@ export function AddSourceDialog({
   // Batch-specific state
   const [urlValidationErrors, setUrlValidationErrors] = useState<{ url: string; line: number }[]>([])
   const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null)
+  const [gitPreviewItems, setGitPreviewItems] = useState<GitSyncPreviewItem[]>([])
+  const [gitPreviewWarnings, setGitPreviewWarnings] = useState<string[]>([])
+  const [gitSelectedPaths, setGitSelectedPaths] = useState<string[]>([])
 
   // Cleanup timeouts to prevent memory leaks
   const timeoutRef = useRef<NodeJS.Timeout | null>(null)
@@ -188,6 +189,7 @@ export function AddSourceDialog({
   // API hooks
   const createSource = useCreateSource()
   const createGitSyncSource = useCreateGitSyncSource()
+  const previewGitSyncSource = usePreviewGitSyncSource()
   const createCredential = useCreateCredential()
   const { data: notebooks = [], isLoading: notebooksLoading } = useNotebooks()
   const { data: transformations = [], isLoading: transformationsLoading } = useTransformations()
@@ -269,6 +271,54 @@ export function AddSourceDialog({
   const watchedGitPaths = watch('git_paths')
   const watchedGitSeedPaths = watch('git_seed_paths')
   const watchedGitProvider = watch('git_provider') || 'azure_devops'
+  const watchedGitRepo = watch('git_repo')
+  const watchedGitBranch = watch('git_branch')
+  const watchedGitCredentialId = watch('git_credential_id')
+  const watchedGitPublic = watch('git_public')
+
+  const isGitFlow = selectedType === 'git'
+
+  const stepKeys: WizardStepKey[] = useMemo(
+    () => isGitFlow
+      ? ['source', 'preview', 'notebooks', 'processing']
+      : ['source', 'notebooks', 'processing'],
+    [isGitFlow]
+  )
+
+  const WIZARD_STEPS: readonly WizardStep[] = useMemo(
+    () => stepKeys.map((stepKey, index) => {
+      if (stepKey === 'source') {
+        return {
+          number: index + 1,
+          title: t.sources.addSource,
+          description: t.sources.processDescription,
+        }
+      }
+      if (stepKey === 'preview') {
+        return {
+          number: index + 1,
+          title: isPortuguese ? 'Confirmar arquivos' : 'Confirm files',
+          description: isPortuguese ? 'Revise os arquivos identificados' : 'Review identified files',
+        }
+      }
+      if (stepKey === 'notebooks') {
+        return {
+          number: index + 1,
+          title: t.navigation.notebooks,
+          description: t.notebooks.searchPlaceholder,
+        }
+      }
+      return {
+        number: index + 1,
+        title: t.navigation.process,
+        description: t.sources.processDescription,
+      }
+    }),
+    [isGitFlow, isPortuguese, stepKeys, t.navigation.notebooks, t.navigation.process, t.notebooks.searchPlaceholder, t.sources.addSource, t.sources.processDescription]
+  )
+
+  const totalSteps = stepKeys.length
+  const getStepKey = (step: number): WizardStepKey => stepKeys[step - 1] || 'source'
 
   const gitCredentials = useMemo(
     () => watchedGitProvider === 'github' ? githubCredentials : azureDevopsCredentials,
@@ -287,6 +337,21 @@ export function AddSourceDialog({
       setValue('git_credential_id', '', { shouldValidate: true })
     }
   }, [gitCredentials, setValue, watch, watchedGitProvider])
+
+  useEffect(() => {
+    setGitPreviewItems([])
+    setGitPreviewWarnings([])
+    setGitSelectedPaths([])
+  }, [
+    selectedType,
+    watchedGitProvider,
+    watchedGitPublic,
+    watchedGitRepo,
+    watchedGitBranch,
+    watchedGitPaths,
+    watchedGitSeedPaths,
+    watchedGitCredentialId,
+  ])
 
   // Batch mode detection
   const { isBatchMode, itemCount, parsedUrls, parsedFiles, parsedGitPaths, parsedGitSeedPaths } = useMemo(() => {
@@ -336,8 +401,8 @@ export function AddSourceDialog({
 
   // Step validation - now reactive with watched values
   const isStepValid = (step: number): boolean => {
-    switch (step) {
-      case 1:
+    switch (getStepKey(step)) {
+      case 'source':
         if (!selectedType) return false
         // Check batch size limit
         if (isOverLimit) return false
@@ -372,21 +437,62 @@ export function AddSourceDialog({
             )
         }
         return true
-      case 2:
-      case 3:
+      case 'preview':
+        return gitPreviewItems.length > 0 && gitSelectedPaths.length > 0
+      case 'notebooks':
+      case 'processing':
         return true
       default:
         return false
     }
   }
 
+  const buildGitSyncRequest = (data: CreateSourceFormData, confirmedPaths?: string[]) => {
+    const provider = data.git_provider || 'azure_devops'
+    const repo = provider === 'github'
+      ? normalizeGitHubRepoInput(data.git_repo || '')
+      : data.git_repo!.trim()
+
+    return {
+      provider,
+      repo,
+      branch: data.git_branch!.trim(),
+      paths: parsedGitPaths,
+      seed_paths: parsedGitSeedPaths,
+      max_discovery_depth: data.git_max_discovery_depth,
+      max_discovery_files: data.git_max_discovery_files,
+      confirmed_paths: confirmedPaths,
+      credential_id: data.git_credential_id?.trim() || undefined,
+      notebooks: selectedNotebooks,
+      transformations: selectedTransformations,
+      embed: data.embed,
+    }
+  }
+
+  const handleGitPreview = async (): Promise<boolean> => {
+    const formData = watch()
+    const preview = await previewGitSyncSource.mutateAsync(buildGitSyncRequest(formData))
+    setGitPreviewItems(preview.items)
+    setGitPreviewWarnings(preview.warnings)
+    setGitSelectedPaths(preview.items.map(item => item.path))
+    if (preview.items.length === 0) {
+      toast.error(
+        isPortuguese
+          ? 'Nenhum arquivo elegível foi identificado para importar.'
+          : 'No eligible files were identified for import.'
+      )
+      return false
+    }
+    return true
+  }
+
   // Navigation
-  const handleNextStep = (e?: React.MouseEvent) => {
+  const handleNextStep = async (e?: React.MouseEvent) => {
     e?.preventDefault()
     e?.stopPropagation()
 
     // Validate URLs when leaving step 1 in link mode
-    if (currentStep === 1 && selectedType === 'link' && watchedUrl) {
+    if (getStepKey(currentStep) === 'source' && selectedType === 'link' && watchedUrl) {
       const { invalid } = parseAndValidateUrls(watchedUrl)
       if (invalid.length > 0) {
         setUrlValidationErrors(invalid)
@@ -395,7 +501,18 @@ export function AddSourceDialog({
       setUrlValidationErrors([])
     }
 
-    if (currentStep < 3 && isStepValid(currentStep)) {
+    if (!isStepValid(currentStep)) {
+      return
+    }
+
+    if (getStepKey(currentStep) === 'source' && selectedType === 'git') {
+      const hasPreviewItems = await handleGitPreview()
+      if (!hasPreviewItems) {
+        return
+      }
+    }
+
+    if (currentStep < totalSteps) {
       setCurrentStep(currentStep + 1)
     }
   }
@@ -413,10 +530,24 @@ export function AddSourceDialog({
     }
   }
 
-  const handleStepClick = (step: number) => {
-    if (step <= currentStep || (step === currentStep + 1 && isStepValid(currentStep))) {
+  const handleStepClick = async (step: number) => {
+    if (step <= currentStep) {
       setCurrentStep(step)
+      return
     }
+
+    if (step !== currentStep + 1 || !isStepValid(currentStep)) {
+      return
+    }
+
+    if (getStepKey(currentStep) === 'source' && selectedType === 'git') {
+      const hasPreviewItems = await handleGitPreview()
+      if (!hasPreviewItems) {
+        return
+      }
+    }
+
+    setCurrentStep(step)
   }
 
   // Selection handlers
@@ -432,6 +563,22 @@ export function AddSourceDialog({
       ? selectedTransformations.filter(id => id !== transformationId)
       : [...selectedTransformations, transformationId]
     setSelectedTransformations(updated)
+  }
+
+  const handleGitPreviewToggle = (path: string) => {
+    setGitSelectedPaths(prev => (
+      prev.includes(path)
+        ? prev.filter(item => item !== path)
+        : [...prev, path]
+    ))
+  }
+
+  const handleSelectAllGitPreviewPaths = () => {
+    setGitSelectedPaths(gitPreviewItems.map(item => item.path))
+  }
+
+  const handleClearGitPreviewPaths = () => {
+    setGitSelectedPaths([])
   }
 
   const handleGitCredentialFieldChange = (
@@ -489,24 +636,9 @@ export function AddSourceDialog({
   // Single source submission
   const submitSingleSource = async (data: CreateSourceFormData): Promise<void> => {
     if (data.type === 'git') {
-      const provider = data.git_provider || 'azure_devops'
-      const repo = provider === 'github'
-        ? normalizeGitHubRepoInput(data.git_repo || '')
-        : data.git_repo!.trim()
-
-      await createGitSyncSource.mutateAsync({
-        provider,
-        repo,
-        branch: data.git_branch!.trim(),
-        paths: parsedGitPaths,
-        seed_paths: parsedGitSeedPaths,
-        max_discovery_depth: data.git_max_discovery_depth,
-        max_discovery_files: data.git_max_discovery_files,
-        credential_id: data.git_credential_id?.trim() || undefined,
-        notebooks: selectedNotebooks,
-        transformations: selectedTransformations,
-        embed: data.embed,
-      })
+      await createGitSyncSource.mutateAsync(
+        buildGitSyncRequest(data, gitSelectedPaths)
+      )
       return
     }
 
@@ -652,6 +784,9 @@ export function AddSourceDialog({
     setSelectedNotebooks(defaultNotebookId ? [defaultNotebookId] : [])
     setUrlValidationErrors([])
     setBatchProgress(null)
+    setGitPreviewItems([])
+    setGitPreviewWarnings([])
+    setGitSelectedPaths([])
     setGitCredentialDialogOpen(false)
     setGitCredentialForm({ provider: watchedGitProvider, name: '', baseUrl: '', apiKey: '' })
 
@@ -749,6 +884,7 @@ export function AddSourceDialog({
   }
 
   const currentStepValid = isStepValid(currentStep)
+  const isSubmitting = createSource.isPending || createGitSyncSource.isPending || previewGitSyncSource.isPending
 
   return (
     <Dialog open={open} onOpenChange={handleClose}>
@@ -767,7 +903,7 @@ export function AddSourceDialog({
             onStepClick={handleStepClick}
             className="border-0"
           >
-            {currentStep === 1 && (
+            {getStepKey(currentStep) === 'source' && (
               <SourceTypeStep
                 // @ts-expect-error - Type inference issue with zod schema
                 control={control}
@@ -788,8 +924,20 @@ export function AddSourceDialog({
                 }}
               />
             )}
-            
-            {currentStep === 2 && (
+
+            {getStepKey(currentStep) === 'preview' && (
+              <GitSourcePreviewStep
+                items={gitPreviewItems}
+                warnings={gitPreviewWarnings}
+                selectedPaths={gitSelectedPaths}
+                isPortuguese={isPortuguese}
+                onTogglePath={handleGitPreviewToggle}
+                onSelectAll={handleSelectAllGitPreviewPaths}
+                onClearSelection={handleClearGitPreviewPaths}
+              />
+            )}
+
+            {getStepKey(currentStep) === 'notebooks' && (
               <NotebooksStep
                 notebooks={notebooks}
                 selectedNotebooks={selectedNotebooks}
@@ -797,8 +945,8 @@ export function AddSourceDialog({
                 loading={notebooksLoading}
               />
             )}
-            
-            {currentStep === 3 && (
+
+            {getStepKey(currentStep) === 'processing' && (
               <ProcessingStep
                 // @ts-expect-error - Type inference issue with zod schema
                 control={control}
@@ -833,24 +981,26 @@ export function AddSourceDialog({
               )}
 
               {/* Show Next button on steps 1 and 2, styled as outline/secondary */}
-              {currentStep < 3 && (
+              {currentStep < totalSteps && (
                 <Button
                   type="button"
                   variant="outline"
-                  onClick={(e) => handleNextStep(e)}
-                  disabled={!currentStepValid}
+                  onClick={(e) => { void handleNextStep(e) }}
+                  disabled={!currentStepValid || previewGitSyncSource.isPending}
                 >
-                  {t.common.next}
+                  {previewGitSyncSource.isPending
+                    ? (isPortuguese ? 'Identificando...' : 'Discovering...')
+                    : t.common.next}
                 </Button>
               )}
 
               {/* Show Done button on all steps, styled as primary */}
               <Button
                 type="submit"
-                disabled={!currentStepValid || createSource.isPending || createGitSyncSource.isPending}
+                disabled={!currentStepValid || getStepKey(currentStep) !== 'processing' || isSubmitting}
                 className="min-w-[120px]"
               >
-                {createSource.isPending || createGitSyncSource.isPending ? t.common.adding : t.common.done}
+                {isSubmitting ? t.common.adding : t.common.done}
               </Button>
             </div>
           </div>
