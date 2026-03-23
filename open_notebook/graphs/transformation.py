@@ -1,16 +1,25 @@
+import asyncio
+import os
+import time
+
 from ai_prompter import Prompter
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from loguru import logger
 from typing_extensions import TypedDict
 
 from open_notebook.ai.provision import provision_langchain_model
 from open_notebook.domain.notebook import Source
 from open_notebook.domain.transformation import DefaultPrompts, Transformation
-from open_notebook.exceptions import OpenNotebookError
+from open_notebook.exceptions import OpenNotebookError, TimeoutExceededError
 from open_notebook.utils import clean_thinking_content
 from open_notebook.utils.error_classifier import classify_error
 from open_notebook.utils.text_utils import extract_text_content
+
+TRANSFORMATION_TIMEOUT_SECONDS = int(
+    os.getenv("OPEN_NOTEBOOK_TRANSFORMATION_TIMEOUT_SECONDS", "180")
+)
 
 
 class TransformationState(TypedDict):
@@ -26,6 +35,9 @@ async def run_transformation(state: dict, config: RunnableConfig) -> dict:
     content = state.get("input_text")
     assert source or content, "No content to transform"
     transformation: Transformation = state["transformation"]
+    source_id = str(source.id) if source and source.id else "unknown"
+    transformation_id = str(getattr(transformation, "id", "")) or "unknown"
+    transformation_title = getattr(transformation, "title", None) or transformation_id
 
     try:
         if not content:
@@ -48,8 +60,26 @@ async def run_transformation(state: dict, config: RunnableConfig) -> dict:
             "transformation",
             max_tokens=8192,
         )
+        logger.info(
+            "Starting transformation LLM call source={} transformation={} timeout={}s chars={}",
+            source_id,
+            transformation_title,
+            TRANSFORMATION_TIMEOUT_SECONDS,
+            len(content_str),
+        )
+        start_time = time.perf_counter()
 
-        response = await chain.ainvoke(payload)
+        response = await asyncio.wait_for(
+            chain.ainvoke(payload),
+            timeout=TRANSFORMATION_TIMEOUT_SECONDS,
+        )
+        duration = time.perf_counter() - start_time
+        logger.info(
+            "Completed transformation LLM call source={} transformation={} duration={:.2f}s",
+            source_id,
+            transformation_title,
+            duration,
+        )
 
         # Clean thinking content from the response
         response_content = extract_text_content(response.content)
@@ -61,6 +91,19 @@ async def run_transformation(state: dict, config: RunnableConfig) -> dict:
         return {
             "output": cleaned_content,
         }
+    except asyncio.TimeoutError as e:
+        duration = time.perf_counter() - start_time if "start_time" in locals() else 0.0
+        logger.error(
+            "Transformation timed out source={} transformation={} timeout={}s duration={:.2f}s",
+            source_id,
+            transformation_title,
+            TRANSFORMATION_TIMEOUT_SECONDS,
+            duration,
+        )
+        raise TimeoutExceededError(
+            f"Transformation '{transformation_title}' timed out after "
+            f"{TRANSFORMATION_TIMEOUT_SECONDS} seconds for source {source_id}."
+        ) from e
     except OpenNotebookError:
         raise
     except Exception as e:

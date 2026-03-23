@@ -24,6 +24,8 @@ interface CreateSourceFormData {
   git_branch?: string
   git_paths?: string
   git_seed_paths?: string
+  git_include_extensions?: string
+  git_exclude_extensions?: string
   git_max_discovery_depth?: number
   git_max_discovery_files?: number
   git_credential_id?: string
@@ -338,6 +340,22 @@ export function SourceTypeStep({
 
                   {type.value === 'git' && (
                     <div className="space-y-4">
+                      <div className="rounded-lg border border-primary/20 bg-primary/5 p-4">
+                        <div className="flex items-center gap-2">
+                          <Badge variant="secondary">
+                            {isPortuguese ? 'Novo' : 'New'}
+                          </Badge>
+                          <p className="text-sm font-medium">
+                            {isPortuguese ? 'Filtros de formato do sync' : 'Sync format filters'}
+                          </p>
+                        </div>
+                        <p className="mt-2 text-sm text-muted-foreground">
+                          {isPortuguese
+                            ? 'Use os campos de formato abaixo para importar apenas extensoes especificas ou ignorar formatos que nao devem virar fontes.'
+                            : 'Use the format fields below to import only specific extensions or ignore formats that should not become sources.'}
+                        </p>
+                      </div>
+
                       <div>
                         <Label htmlFor="git_provider" className="mb-2 block">
                           {isPortuguese ? 'Provider Git *' : 'Git provider *'}
@@ -507,6 +525,44 @@ export function SourceTypeStep({
                         {errors.git_seed_paths && (
                           <p className="text-sm text-destructive mt-1">{errors.git_seed_paths.message}</p>
                         )}
+                      </div>
+
+                      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                        <div>
+                          <Label htmlFor="git_include_extensions" className="mb-2 block">
+                            {isPortuguese ? 'Importar apenas formatos' : 'Only import formats'}
+                          </Label>
+                          <Textarea
+                            id="git_include_extensions"
+                            {...register('git_include_extensions')}
+                            placeholder={isPortuguese ? '.md\n.puml' : '.md\n.puml'}
+                            rows={3}
+                            className="font-mono text-sm"
+                          />
+                          <p className="text-xs text-muted-foreground mt-1">
+                            {isPortuguese
+                              ? 'Um formato por linha. Se preencher, só esses formatos serão elegíveis.'
+                              : 'One extension per line. When set, only these formats will be eligible.'}
+                          </p>
+                        </div>
+
+                        <div>
+                          <Label htmlFor="git_exclude_extensions" className="mb-2 block">
+                            {isPortuguese ? 'Ignorar formatos' : 'Ignore formats'}
+                          </Label>
+                          <Textarea
+                            id="git_exclude_extensions"
+                            {...register('git_exclude_extensions')}
+                            placeholder={isPortuguese ? '.svg' : '.svg'}
+                            rows={3}
+                            className="font-mono text-sm"
+                          />
+                          <p className="text-xs text-muted-foreground mt-1">
+                            {isPortuguese
+                              ? 'Um formato por linha. A exclusão tem prioridade sobre a inclusão.'
+                              : 'One extension per line. Exclusions take precedence over inclusions.'}
+                          </p>
+                        </div>
                       </div>
 
                       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">

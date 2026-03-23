@@ -1,0 +1,4 @@
+DEFINE FIELD include_extensions ON git_sync TYPE array DEFAULT [];
+DEFINE FIELD include_extensions.* ON git_sync TYPE string;
+DEFINE FIELD exclude_extensions ON git_sync TYPE array DEFAULT [];
+DEFINE FIELD exclude_extensions.* ON git_sync TYPE string;

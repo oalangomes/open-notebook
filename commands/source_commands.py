@@ -6,10 +6,10 @@ from loguru import logger
 from pydantic import BaseModel
 from surreal_commands import CommandInput, CommandOutput, command
 
-from open_notebook.database.repository import ensure_record_id
+from open_notebook.database.repository import ensure_record_id, repo_update
 from open_notebook.domain.notebook import Asset, Source
 from open_notebook.domain.transformation import Transformation
-from open_notebook.exceptions import ConfigurationError, NotFoundError
+from open_notebook.exceptions import ConfigurationError, NotFoundError, TimeoutExceededError
 
 try:
     from open_notebook.graphs.source import source_graph
@@ -51,6 +51,30 @@ SOURCE_LOOKUP_ATTEMPTS = 3
 SOURCE_LOOKUP_DELAY_SECONDS = 0.2
 
 
+async def _update_command_progress(
+    input_data: SourceProcessingInput,
+    stage: str,
+    message: str,
+) -> None:
+    execution_context = getattr(input_data, "execution_context", None)
+    command_id = getattr(execution_context, "command_id", None)
+    if not command_id:
+        return
+    try:
+        await repo_update(
+            "command",
+            str(command_id),
+            {"progress": {"stage": stage, "message": message}},
+        )
+    except Exception as exc:
+        logger.debug(
+            "Failed to update process_source progress command={} stage={}: {}",
+            command_id,
+            stage,
+            exc,
+        )
+
+
 async def _get_source_with_retry(source_id: str) -> Source:
     last_error: Optional[Exception] = None
 
@@ -79,7 +103,7 @@ async def _get_source_with_retry(source_id: str) -> Source:
         "wait_strategy": "exponential_jitter",
         "wait_min": 1,
         "wait_max": 120,  # Allow queue to drain
-        "stop_on": [ValueError, ConfigurationError],  # Don't retry validation/config errors
+        "stop_on": [ValueError, ConfigurationError, TimeoutExceededError],  # Don't retry validation/config errors
         "retry_log_level": "debug",  # Avoid log noise during transaction conflicts
     },
 )
@@ -96,6 +120,11 @@ async def process_source_command(
         logger.info(f"Notebook IDs: {input_data.notebook_ids}")
         logger.info(f"Transformations: {input_data.transformations}")
         logger.info(f"Embed: {input_data.embed}")
+        await _update_command_progress(
+            input_data,
+            "loading_transformations",
+            "Loading transformations",
+        )
 
         # 1. Load transformation objects from IDs
         transformations = []
@@ -110,6 +139,11 @@ async def process_source_command(
 
         # 2. Get existing source record to update its command field
         source = await _get_source_with_retry(input_data.source_id)
+        await _update_command_progress(
+            input_data,
+            "persisting_source",
+            "Persisting source state",
+        )
 
         # Update source with command reference
         source.command = (
@@ -143,9 +177,25 @@ async def process_source_command(
             await source.save()
 
             if input_data.embed and source.full_text.strip():
+                await _update_command_progress(
+                    input_data,
+                    "embedding_submitted",
+                    "Submitting embedding job",
+                )
                 await source.vectorize()
 
             for transformation in transformations:
+                transformation_label = transformation.title or str(transformation.id)
+                logger.info(
+                    "Running transformation source={} transformation={}",
+                    input_data.source_id,
+                    transformation_label,
+                )
+                await _update_command_progress(
+                    input_data,
+                    "running_transformation",
+                    f"Running transformation: {transformation_label}",
+                )
                 await transform_graph.ainvoke(
                     {
                         "source": source,
@@ -173,6 +223,11 @@ async def process_source_command(
         # Note: embedding is fire-and-forget (async job), so we can't query the
         # count here — it hasn't completed yet. The embed_source_command logs
         # the actual count when it finishes.
+        await _update_command_progress(
+            input_data,
+            "finalizing",
+            "Finalizing source processing",
+        )
         insights_list = await processed_source.get_insights()
         insights_created = len(insights_list)
 
@@ -184,6 +239,11 @@ async def process_source_command(
         logger.info(
             f"Created {insights_created} insights, embedding {embed_status}"
         )
+        await _update_command_progress(
+            input_data,
+            "completed",
+            "Source processing completed",
+        )
 
         return SourceProcessingOutput(
             success=True,
@@ -193,10 +253,15 @@ async def process_source_command(
             processing_time=processing_time,
         )
 
-    except ValueError as e:
+    except (ValueError, ConfigurationError, TimeoutExceededError) as e:
         # Validation errors are permanent failures - don't retry
         processing_time = time.time() - start_time
         logger.error(f"Source processing failed: {e}")
+        await _update_command_progress(
+            input_data,
+            "failed",
+            f"Source processing failed: {e}",
+        )
         return SourceProcessingOutput(
             success=False,
             source_id=input_data.source_id,
@@ -241,7 +306,7 @@ class RunTransformationOutput(CommandOutput):
         "wait_strategy": "exponential_jitter",
         "wait_min": 1,
         "wait_max": 60,
-        "stop_on": [ValueError, ConfigurationError],  # Don't retry validation/config errors
+        "stop_on": [ValueError, ConfigurationError, TimeoutExceededError],  # Don't retry validation/config errors
         "retry_log_level": "debug",
     },
 )
@@ -302,7 +367,7 @@ async def run_transformation_command(
             processing_time=processing_time,
         )
 
-    except ValueError as e:
+    except (ValueError, ConfigurationError, TimeoutExceededError) as e:
         # Validation errors are permanent failures - don't retry
         processing_time = time.time() - start_time
         logger.error(

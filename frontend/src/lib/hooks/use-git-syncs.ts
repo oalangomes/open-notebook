@@ -34,10 +34,10 @@ export function useCreateGitSyncSource() {
         refetchType: 'active',
       })
 
-      const { created, updated, repaired, skipped, failed } = result.summary
+      const { created, updated, repaired, skipped, failed, filtered_out } = result.summary
       const description = isPortuguese
-        ? `Sync concluído: ${created} criado(s), ${updated} atualizado(s), ${repaired} reparado(s), ${skipped} sem mudança, ${failed} falha(s).`
-        : `Sync completed: ${created} created, ${updated} updated, ${repaired} repaired, ${skipped} unchanged, ${failed} failed.`
+        ? `Sync concluído: ${created} criado(s), ${updated} atualizado(s), ${repaired} reparado(s), ${skipped} sem mudança, ${failed} falha(s), ${filtered_out} filtrado(s).`
+        : `Sync completed: ${created} created, ${updated} updated, ${repaired} repaired, ${skipped} unchanged, ${failed} failed, ${filtered_out} filtered out.`
 
       toast({
         title: isPortuguese ? 'Fonte Git sincronizada' : 'Git source synced',

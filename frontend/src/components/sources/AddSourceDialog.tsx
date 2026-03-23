@@ -43,6 +43,8 @@ const createSourceSchema = z.object({
   git_branch: z.string().optional(),
   git_paths: z.string().optional(),
   git_seed_paths: z.string().optional(),
+  git_include_extensions: z.string().optional(),
+  git_exclude_extensions: z.string().optional(),
   git_max_discovery_depth: z.number().int().min(0).max(10).optional(),
   git_max_discovery_files: z.number().int().min(1).max(5000).optional(),
   git_credential_id: z.string().optional(),
@@ -273,6 +275,8 @@ export function AddSourceDialog({
   const watchedGitProvider = watch('git_provider') || 'azure_devops'
   const watchedGitRepo = watch('git_repo')
   const watchedGitBranch = watch('git_branch')
+  const watchedGitIncludeExtensions = watch('git_include_extensions')
+  const watchedGitExcludeExtensions = watch('git_exclude_extensions')
   const watchedGitCredentialId = watch('git_credential_id')
   const watchedGitPublic = watch('git_public')
 
@@ -350,17 +354,30 @@ export function AddSourceDialog({
     watchedGitBranch,
     watchedGitPaths,
     watchedGitSeedPaths,
+    watchedGitIncludeExtensions,
+    watchedGitExcludeExtensions,
     watchedGitCredentialId,
   ])
 
   // Batch mode detection
-  const { isBatchMode, itemCount, parsedUrls, parsedFiles, parsedGitPaths, parsedGitSeedPaths } = useMemo(() => {
+  const {
+    isBatchMode,
+    itemCount,
+    parsedUrls,
+    parsedFiles,
+    parsedGitPaths,
+    parsedGitSeedPaths,
+    parsedGitIncludeExtensions,
+    parsedGitExcludeExtensions,
+  } = useMemo(() => {
     let urlCount = 0
     let fileCount = 0
     let parsedUrls: string[] = []
     let parsedFiles: File[] = []
     let parsedGitPaths: string[] = []
     let parsedGitSeedPaths: string[] = []
+    let parsedGitIncludeExtensions: string[] = []
+    let parsedGitExcludeExtensions: string[] = []
 
     if (selectedType === 'link' && watchedUrl) {
       const { valid } = parseAndValidateUrls(watchedUrl)
@@ -390,11 +407,42 @@ export function AddSourceDialog({
         .filter(Boolean)
     }
 
+    if (selectedType === 'git' && watchedGitIncludeExtensions) {
+      parsedGitIncludeExtensions = watchedGitIncludeExtensions
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean)
+    }
+
+    if (selectedType === 'git' && watchedGitExcludeExtensions) {
+      parsedGitExcludeExtensions = watchedGitExcludeExtensions
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean)
+    }
+
     const isBatchMode = urlCount > 1 || fileCount > 1
     const itemCount = selectedType === 'link' ? urlCount : fileCount
 
-    return { isBatchMode, itemCount, parsedUrls, parsedFiles, parsedGitPaths, parsedGitSeedPaths }
-  }, [selectedType, watchedUrl, watchedFile, watchedGitPaths, watchedGitSeedPaths])
+    return {
+      isBatchMode,
+      itemCount,
+      parsedUrls,
+      parsedFiles,
+      parsedGitPaths,
+      parsedGitSeedPaths,
+      parsedGitIncludeExtensions,
+      parsedGitExcludeExtensions,
+    }
+  }, [
+    selectedType,
+    watchedUrl,
+    watchedFile,
+    watchedGitPaths,
+    watchedGitSeedPaths,
+    watchedGitIncludeExtensions,
+    watchedGitExcludeExtensions,
+  ])
 
   // Check for batch size limit
   const isOverLimit = itemCount > MAX_BATCH_SIZE
@@ -459,6 +507,8 @@ export function AddSourceDialog({
       branch: data.git_branch!.trim(),
       paths: parsedGitPaths,
       seed_paths: parsedGitSeedPaths,
+      include_extensions: parsedGitIncludeExtensions,
+      exclude_extensions: parsedGitExcludeExtensions,
       max_discovery_depth: data.git_max_discovery_depth,
       max_discovery_files: data.git_max_discovery_files,
       confirmed_paths: confirmedPaths,
@@ -888,7 +938,7 @@ export function AddSourceDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-[700px] p-0">
+      <DialogContent className="max-h-[92vh] overflow-hidden sm:max-w-[760px] p-0">
         <DialogHeader className="px-6 pt-6 pb-0">
           <DialogTitle>{t.sources.addNew}</DialogTitle>
           <DialogDescription>
@@ -929,6 +979,8 @@ export function AddSourceDialog({
               <GitSourcePreviewStep
                 items={gitPreviewItems}
                 warnings={gitPreviewWarnings}
+                includeExtensions={parsedGitIncludeExtensions}
+                excludeExtensions={parsedGitExcludeExtensions}
                 selectedPaths={gitSelectedPaths}
                 isPortuguese={isPortuguese}
                 onTogglePath={handleGitPreviewToggle}

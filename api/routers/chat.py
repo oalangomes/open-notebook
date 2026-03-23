@@ -1,4 +1,6 @@
 import asyncio
+import os
+import time
 import traceback
 from typing import Any, Dict, List, Optional
 
@@ -16,6 +18,7 @@ from open_notebook.graphs.chat import graph as chat_graph
 from open_notebook.utils.graph_utils import get_session_message_count
 
 router = APIRouter()
+CHAT_EXECUTE_TIMEOUT_SECONDS = int(os.getenv("OPEN_NOTEBOOK_CHAT_TIMEOUT_SECONDS", "180"))
 
 
 # Request/Response models
@@ -368,15 +371,35 @@ async def execute_chat(request: ExecuteChatRequest):
         user_message = HumanMessage(content=request.message)
         state_values["messages"].append(user_message)
 
-        # Execute chat graph
-        result = chat_graph.invoke(
-            input=state_values,  # type: ignore[arg-type]
-            config=RunnableConfig(
-                configurable={
-                    "thread_id": full_session_id,
-                    "model_id": model_override,
-                }
+        invoke_config = RunnableConfig(
+            configurable={
+                "thread_id": full_session_id,
+                "model_id": model_override,
+            }
+        )
+        start_time = time.perf_counter()
+        logger.info(
+            "Starting chat execution for session={} model_override={} timeout={}s",
+            full_session_id,
+            model_override,
+            CHAT_EXECUTE_TIMEOUT_SECONDS,
+        )
+
+        # Execute the graph in a worker thread so a slow LLM call does not block the API event loop.
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                chat_graph.invoke,
+                state_values,  # type: ignore[arg-type]
+                invoke_config,
             ),
+            timeout=CHAT_EXECUTE_TIMEOUT_SECONDS,
+        )
+        duration = time.perf_counter() - start_time
+        logger.info(
+            "Finished chat execution for session={} duration={:.2f}s messages={}",
+            full_session_id,
+            duration,
+            len(result.get("messages", [])),
         )
 
         # Update session timestamp
@@ -395,6 +418,19 @@ async def execute_chat(request: ExecuteChatRequest):
             )
 
         return ExecuteChatResponse(session_id=request.session_id, messages=messages)
+    except asyncio.TimeoutError:
+        logger.error(
+            "Chat execution timed out for session={} timeout={}s",
+            request.session_id,
+            CHAT_EXECUTE_TIMEOUT_SECONDS,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Chat execution timed out. "
+                "The request was interrupted to keep the application responsive."
+            ),
+        )
     except NotFoundError:
         raise HTTPException(status_code=404, detail="Session not found")
     except Exception as e:

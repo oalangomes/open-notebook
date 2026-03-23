@@ -1,10 +1,11 @@
+import asyncio
 import posixpath
 import re
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -55,11 +56,16 @@ class GitSyncService:
     @staticmethod
     async def list_syncs() -> List[GitSyncResponse]:
         syncs = await GitSync.get_all(order_by="updated desc")
-        return [GitSyncService.to_response(sync) for sync in syncs]
+        responses: List[GitSyncResponse] = []
+        for sync in syncs:
+            await GitSyncService._reconcile_sync_state(sync)
+            responses.append(GitSyncService.to_response(sync))
+        return responses
 
     @staticmethod
     async def get_sync(sync_id: str) -> GitSyncResponse:
         sync = await GitSync.get(sync_id)
+        await GitSyncService._reconcile_sync_state(sync)
         return GitSyncService.to_response(sync)
 
     @staticmethod
@@ -88,6 +94,13 @@ class GitSyncService:
             max_discovery_files=request.max_discovery_files,
             client=client,
         )
+        items, filter_warnings, _, _ = GitSyncService._apply_extension_filters(
+            items=items,
+            include_extensions=request.include_extensions,
+            exclude_extensions=request.exclude_extensions,
+            sync_id=None,
+        )
+        warnings.extend(filter_warnings)
         return GitSyncPreviewResponse(
             items=[
                 GitSyncPreviewItemResponse(
@@ -109,6 +122,8 @@ class GitSyncService:
             paths=request.paths,
             seed_paths=request.seed_paths,
             confirmed_paths=request.confirmed_paths,
+            include_extensions=request.include_extensions,
+            exclude_extensions=request.exclude_extensions,
             credential_id=request.credential_id,
             notebooks=request.notebooks,
             transformations=request.transformations,
@@ -123,6 +138,8 @@ class GitSyncService:
             max_discovery_depth=request.max_discovery_depth,
             max_discovery_files=request.max_discovery_files,
             confirmed_paths=request.confirmed_paths,
+            include_extensions=request.include_extensions,
+            exclude_extensions=request.exclude_extensions,
             credential_id=request.credential_id,
             notebooks=request.notebooks,
             transformations=request.transformations,
@@ -158,6 +175,16 @@ class GitSyncService:
                 if request.confirmed_paths is not None
                 else sync.confirmed_paths
             ),
+            include_extensions=(
+                request.include_extensions
+                if request.include_extensions is not None
+                else sync.include_extensions
+            ),
+            exclude_extensions=(
+                request.exclude_extensions
+                if request.exclude_extensions is not None
+                else sync.exclude_extensions
+            ),
             credential_id=credential_id,
             notebooks=notebooks,
             transformations=transformations,
@@ -175,6 +202,10 @@ class GitSyncService:
             sync.max_discovery_files = request.max_discovery_files
         if request.confirmed_paths is not None:
             sync.confirmed_paths = request.confirmed_paths
+        if request.include_extensions is not None:
+            sync.include_extensions = request.include_extensions
+        if request.exclude_extensions is not None:
+            sync.exclude_extensions = request.exclude_extensions
         if request.credential_id is not None:
             sync.credential_id = request.credential_id
         if request.notebooks is not None:
@@ -200,7 +231,7 @@ class GitSyncService:
         )
         client = GitSyncService._build_client(sync.provider, credential)
         if sync.confirmed_paths:
-            effective_paths = [
+            candidate_paths = [
                 path
                 for path in (
                     GitSyncService._normalize_repo_path(path)
@@ -209,10 +240,19 @@ class GitSyncService:
                 if path
             ]
         else:
-            effective_paths = await GitSyncService._resolve_sync_paths(sync, client)
+            candidate_paths = await GitSyncService._resolve_sync_paths(sync, client)
+        effective_paths, _, filtered_out_count, filtered_extension_counts = (
+            GitSyncService._filter_paths(
+                candidate_paths,
+                include_extensions=sync.include_extensions,
+                exclude_extensions=sync.exclude_extensions,
+                sync_id=sync.id,
+            )
+        )
         sync.sync_path_states(effective_paths)
 
         summary = GitSyncRunSummary(started_at=datetime.now(timezone.utc))
+        summary.filtered_out = filtered_out_count
 
         for path in effective_paths:
             state = sync.upsert_file_state(path)
@@ -250,6 +290,8 @@ class GitSyncService:
                             state.last_sync = file_sync_time
                             state.last_status = "skipped"
                             state.last_error = None
+                            state.command_id = None
+                            state.command_updated_at = None
                             continue
 
                         await GitSyncService._persist_source_content(
@@ -262,22 +304,19 @@ class GitSyncService:
                             existing_source,
                             sync.notebooks,
                         )
-                        command_id = await GitSyncService._submit_source_processing(
-                            source=existing_source,
-                            sync=sync,
-                            content=fetch_result.content,
-                            raw_url=fetch_result.raw_url,
-                            source_title=source_title,
-                            file_path=path,
-                        )
                         state.source_id = existing_source.id
                         state.content_hash = fetch_result.content_hash
+                        state.command_id = None
+                        state.command_updated_at = None
                         state.last_sync = file_sync_time
                         state.last_status = "queued"
                         state.last_error = None
                         summary.repaired += 1
                         logger.info(
-                            f"Queued git sync repair for {sync.id} path={path} command={command_id}"
+                            "Prepared git sync repair for {} path={} ext={}",
+                            sync.id,
+                            path,
+                            GitSyncService._extension_key(path),
                         )
                         continue
 
@@ -289,17 +328,10 @@ class GitSyncService:
                     content=fetch_result.content,
                 )
                 await GitSyncService._ensure_source_notebooks(source, sync.notebooks)
-                command_id = await GitSyncService._submit_source_processing(
-                    source=source,
-                    sync=sync,
-                    content=fetch_result.content,
-                    raw_url=fetch_result.raw_url,
-                    source_title=source_title,
-                    file_path=path,
-                )
-
                 state.source_id = source.id
                 state.content_hash = fetch_result.content_hash
+                state.command_id = None
+                state.command_updated_at = None
                 state.last_sync = file_sync_time
                 state.last_status = "queued"
                 state.last_error = None
@@ -310,28 +342,73 @@ class GitSyncService:
                     summary.updated += 1
 
                 logger.info(
-                    f"Queued git sync processing for {sync.id} path={path} command={command_id}"
+                    "Prepared git sync processing for {} path={} ext={}",
+                    sync.id,
+                    path,
+                    GitSyncService._extension_key(path),
                 )
             except (GitRawAuthError, GitRawNotFoundError, GitRawClientError) as exc:
                 summary.failed += 1
+                state.command_id = None
+                state.command_updated_at = None
                 state.last_sync = file_sync_time
                 state.last_status = "failed"
                 state.last_error = str(exc)
-                logger.warning(f"Git sync file failed for {sync.id} path={path}: {exc}")
+                logger.warning(
+                    "Git sync file failed for {} path={} ext={} stage=fetch: {}",
+                    sync.id,
+                    path,
+                    GitSyncService._extension_key(path),
+                    exc,
+                )
             except Exception as exc:
                 summary.failed += 1
+                state.command_id = None
+                state.command_updated_at = None
                 state.last_sync = file_sync_time
                 state.last_status = "failed"
                 state.last_error = str(exc)
-                logger.exception(exc)
+                logger.exception(
+                    "Git sync file failed for {} path={} ext={} stage=process",
+                    sync.id,
+                    path,
+                    GitSyncService._extension_key(path),
+                )
+
+        dispatched = await GitSyncService._dispatch_next_sync_file(sync)
+        if dispatched:
+            logger.info(
+                "Git sync {} dispatched initial file path={} command={}",
+                sync.id,
+                dispatched.path,
+                dispatched.command_id,
+            )
 
         summary.completed_at = datetime.now(timezone.utc)
+        GitSyncService._refresh_summary_metrics(
+            summary,
+            sync.file_states,
+            filtered_extension_counts=filtered_extension_counts,
+        )
         sync.last_run_summary = summary
         sync.last_sync = summary.completed_at
-        sync.last_status = "completed" if summary.failed == 0 else "completed_with_errors"
-        sync.last_error = None if summary.failed == 0 else "One or more files failed to sync"
+        sync.last_status = GitSyncService._derive_sync_status(sync.file_states)
+        sync.last_error = GitSyncService._derive_sync_error(sync.file_states)
         sync.sync_path_states(effective_paths)
         await sync.save()
+
+        logger.info(
+            "Git sync {} finished: created={} updated={} repaired={} skipped={} failed={} filtered_out={} status_counts={} extension_counts={}",
+            sync.id,
+            summary.created,
+            summary.updated,
+            summary.repaired,
+            summary.skipped,
+            summary.failed,
+            summary.filtered_out,
+            summary.status_counts,
+            summary.extension_counts,
+        )
 
         return GitSyncRunResponse(
             sync_id=sync.id or "",
@@ -354,7 +431,13 @@ class GitSyncService:
             client=client,
             sync_id=sync.id,
         )
-        return [item.path for item in items]
+        filtered_items, _, _, _ = GitSyncService._apply_extension_filters(
+            items=items,
+            include_extensions=sync.include_extensions,
+            exclude_extensions=sync.exclude_extensions,
+            sync_id=sync.id,
+        )
+        return [item.path for item in filtered_items]
 
     @staticmethod
     async def _discover_paths(
@@ -539,12 +622,93 @@ class GitSyncService:
         return suffix or None
 
     @staticmethod
+    def _extension_key(path: str) -> str:
+        suffix = PurePosixPath(path).suffix.lower()
+        return suffix or "[no_extension]"
+
+    @staticmethod
     def _is_markdown_path(path: str) -> bool:
         return PurePosixPath(path).suffix.lower() in GitSyncService.MARKDOWN_EXTENSIONS
 
     @staticmethod
     def _is_discoverable_path(path: str) -> bool:
         return PurePosixPath(path).suffix.lower() in GitSyncService.DISCOVERABLE_EXTENSIONS
+
+    @staticmethod
+    def _is_extension_allowed(
+        path: str,
+        include_extensions: List[str],
+        exclude_extensions: List[str],
+    ) -> tuple[bool, Optional[str]]:
+        extension = GitSyncService._extension_key(path)
+        if extension in exclude_extensions:
+            return False, "excluded_extension"
+        if include_extensions and extension not in include_extensions:
+            return False, "not_included_extension"
+        return True, None
+
+    @staticmethod
+    def _apply_extension_filters(
+        items: List[GitDiscoveredPath],
+        include_extensions: List[str],
+        exclude_extensions: List[str],
+        sync_id: Optional[str],
+    ) -> tuple[List[GitDiscoveredPath], List[str], int, Dict[str, Dict[str, int]]]:
+        filtered_items: List[GitDiscoveredPath] = []
+        warnings: List[str] = []
+        filtered_extension_counts: Dict[str, Dict[str, int]] = {}
+        filtered_out_count = 0
+
+        for item in items:
+            allowed, reason = GitSyncService._is_extension_allowed(
+                item.path,
+                include_extensions=include_extensions,
+                exclude_extensions=exclude_extensions,
+            )
+            if allowed:
+                filtered_items.append(item)
+                continue
+
+            filtered_out_count += 1
+            extension = GitSyncService._extension_key(item.path)
+            filtered_extension_counts.setdefault(extension, {})
+            filtered_extension_counts[extension]["filtered_out"] = (
+                filtered_extension_counts[extension].get("filtered_out", 0) + 1
+            )
+            logger.info(
+                "Filtered git sync file for {} path={} ext={} reason={}",
+                sync_id or "preview",
+                item.path,
+                extension,
+                reason,
+            )
+
+        if filtered_out_count:
+            warnings.append(
+                f"Filtered out {filtered_out_count} file(s) by extension rules"
+                if sync_id is None
+                else f"Filtered out {filtered_out_count} file(s) for sync {sync_id} by extension rules"
+            )
+
+        return filtered_items, warnings, filtered_out_count, filtered_extension_counts
+
+    @staticmethod
+    def _filter_paths(
+        paths: List[str],
+        include_extensions: List[str],
+        exclude_extensions: List[str],
+        sync_id: Optional[str],
+    ) -> tuple[List[str], List[str], int, Dict[str, Dict[str, int]]]:
+        items = [GitDiscoveredPath(path=path, source_type="explicit") for path in paths]
+        filtered_items, warnings, filtered_out_count, filtered_extension_counts = (
+            GitSyncService._apply_extension_filters(
+                items=items,
+                include_extensions=include_extensions,
+                exclude_extensions=exclude_extensions,
+                sync_id=sync_id,
+            )
+        )
+        return [item.path for item in filtered_items], warnings, filtered_out_count, filtered_extension_counts
 
     @staticmethod
     async def _validate_discovery_config(
@@ -577,6 +741,8 @@ class GitSyncService:
         paths: List[str],
         seed_paths: List[str],
         confirmed_paths: List[str],
+        include_extensions: List[str],
+        exclude_extensions: List[str],
         credential_id: Optional[str],
         notebooks: List[str],
         transformations: List[str],
@@ -599,6 +765,12 @@ class GitSyncService:
                     status_code=400,
                     detail="confirmed_paths contains invalid repository paths",
                 )
+        overlapping_extensions = sorted(set(include_extensions) & set(exclude_extensions))
+        if overlapping_extensions:
+            logger.warning(
+                "Git sync filters overlap; exclude_extensions will win for: {}",
+                overlapping_extensions,
+            )
 
         for notebook_id in notebooks:
             try:
@@ -822,7 +994,256 @@ class GitSyncService:
         return command_id
 
     @staticmethod
+    async def _dispatch_next_sync_file(sync: GitSync) -> Optional[GitSyncFileState]:
+        if GitSyncService._has_inflight_sync_command(sync.file_states):
+            return None
+
+        next_state = GitSyncService._get_next_queued_state(sync.file_states)
+        if next_state is None:
+            return None
+
+        dispatch_time = datetime.now(timezone.utc)
+        try:
+            if not next_state.source_id:
+                raise ValueError(
+                    f"Missing source_id for sync {sync.id} path={next_state.path}"
+                )
+
+            source = await Source.get(next_state.source_id)
+            if not source.full_text or not source.full_text.strip():
+                raise ValueError(
+                    f"Source {next_state.source_id} for sync {sync.id} path={next_state.path} has no content"
+                )
+
+            raw_url = source.asset.url if source.asset else None
+            if not raw_url:
+                raise ValueError(
+                    f"Source {next_state.source_id} for sync {sync.id} path={next_state.path} has no raw_url"
+                )
+
+            command_id = await GitSyncService._submit_source_processing(
+                source=source,
+                sync=sync,
+                content=source.full_text,
+                raw_url=raw_url,
+                source_title=GitSyncService._build_source_title(next_state.path),
+                file_path=next_state.path,
+            )
+        except Exception as exc:
+            next_state.command_id = None
+            next_state.command_updated_at = None
+            next_state.last_sync = dispatch_time
+            next_state.last_status = "failed"
+            next_state.last_error = str(exc)
+            logger.warning(
+                "Git sync dispatch failed for {} path={} ext={} stage=dispatch: {}",
+                sync.id,
+                next_state.path,
+                GitSyncService._extension_key(next_state.path),
+                exc,
+            )
+            return next_state
+
+        next_state.command_id = command_id
+        next_state.command_updated_at = dispatch_time
+        next_state.last_sync = dispatch_time
+        next_state.last_status = "queued"
+        next_state.last_error = None
+        logger.info(
+            "Dispatched git sync processing for {} path={} ext={} command={}",
+            sync.id,
+            next_state.path,
+            GitSyncService._extension_key(next_state.path),
+            command_id,
+        )
+        return next_state
+
+    @staticmethod
+    def _has_inflight_sync_command(file_states: List[GitSyncFileState]) -> bool:
+        return any(
+            state.active
+            and state.command_id
+            and state.last_status in {"queued", "processing"}
+            for state in file_states
+        )
+
+    @staticmethod
+    def _get_next_queued_state(
+        file_states: List[GitSyncFileState],
+    ) -> Optional[GitSyncFileState]:
+        for state in file_states:
+            if state.active and state.last_status == "queued" and not state.command_id:
+                return state
+        return None
+
+    @staticmethod
+    async def _reconcile_sync_state(sync: GitSync) -> None:
+        sync.hydrate_nested_models()
+        if not sync.file_states:
+            return
+
+        mutated = False
+        file_states_to_check = [
+            state
+            for state in sync.file_states
+            if state.command_id and state.active and state.last_status in {"queued", "processing"}
+        ]
+        if file_states_to_check:
+            command_statuses = await asyncio.gather(
+                *[
+                    CommandService.get_command_status(state.command_id)
+                    for state in file_states_to_check
+                ],
+                return_exceptions=True,
+            )
+            for state, command_status in zip(file_states_to_check, command_statuses):
+                if isinstance(command_status, Exception):
+                    if state.last_status in {"queued", "processing"}:
+                        state.last_status = "failed"
+                        state.last_error = str(command_status)
+                        state.command_updated_at = datetime.now(timezone.utc)
+                        mutated = True
+                    continue
+
+                next_status, next_error = GitSyncService._map_command_status(command_status)
+                command_updated_at = GitSyncService._parse_status_datetime(
+                    command_status.get("updated")
+                )
+                if state.last_status != next_status:
+                    state.last_status = next_status
+                    mutated = True
+                if state.last_error != next_error:
+                    state.last_error = next_error
+                    mutated = True
+                if state.command_updated_at != command_updated_at:
+                    state.command_updated_at = command_updated_at
+                    mutated = True
+                if command_updated_at and state.last_sync != command_updated_at:
+                    state.last_sync = command_updated_at
+                    mutated = True
+
+        dispatched = await GitSyncService._dispatch_next_sync_file(sync)
+        if dispatched is not None:
+            mutated = True
+
+        refreshed_summary = sync.last_run_summary or GitSyncRunSummary()
+        GitSyncService._refresh_summary_metrics(
+            refreshed_summary,
+            sync.file_states,
+            filtered_extension_counts=GitSyncService._extract_filtered_extension_counts(
+                sync.last_run_summary.extension_counts if sync.last_run_summary else None
+            ),
+        )
+        sync.last_run_summary = refreshed_summary
+
+        derived_status = GitSyncService._derive_sync_status(sync.file_states)
+        derived_error = GitSyncService._derive_sync_error(sync.file_states)
+        if sync.last_status != derived_status:
+            sync.last_status = derived_status
+            mutated = True
+        if sync.last_error != derived_error:
+            sync.last_error = derived_error
+            mutated = True
+
+        if mutated:
+            await sync.save()
+
+    @staticmethod
+    def _map_command_status(command_status: Dict[str, Any]) -> tuple[str, Optional[str]]:
+        status = str(command_status.get("status") or "unknown").lower()
+        result = command_status.get("result")
+        error_message = command_status.get("error_message")
+
+        if status in {"new", "queued"}:
+            return "queued", error_message
+        if status == "running":
+            return "processing", error_message
+        if status == "completed":
+            if isinstance(result, dict) and result.get("success") is False:
+                return "failed", str(result.get("error_message") or error_message or "Command failed")
+            return "completed", error_message
+        if status in {"failed", "canceled"}:
+            return "failed", str(error_message or "Command failed")
+        return status, error_message
+
+    @staticmethod
+    def _parse_status_datetime(value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _refresh_summary_metrics(
+        summary: GitSyncRunSummary,
+        file_states: List[GitSyncFileState],
+        filtered_extension_counts: Optional[Dict[str, Dict[str, int]]] = None,
+    ) -> None:
+        status_counts: Dict[str, int] = {}
+        extension_counts: Dict[str, Dict[str, int]] = {}
+
+        for state in file_states:
+            if not state.active:
+                continue
+            status = state.last_status or "unknown"
+            extension = GitSyncService._extension_key(state.path)
+            status_counts[status] = status_counts.get(status, 0) + 1
+            extension_counts.setdefault(extension, {})
+            extension_counts[extension][status] = extension_counts[extension].get(status, 0) + 1
+
+        for extension, counts in (filtered_extension_counts or {}).items():
+            extension_counts.setdefault(extension, {})
+            for status, count in counts.items():
+                extension_counts[extension][status] = extension_counts[extension].get(status, 0) + count
+                status_counts[status] = status_counts.get(status, 0) + count
+
+        summary.skipped = status_counts.get("skipped", summary.skipped)
+        summary.failed = status_counts.get("failed", summary.failed)
+        summary.filtered_out = status_counts.get("filtered_out", summary.filtered_out)
+        summary.status_counts = status_counts
+        summary.extension_counts = extension_counts
+
+    @staticmethod
+    def _extract_filtered_extension_counts(
+        extension_counts: Optional[Dict[str, Dict[str, int]]],
+    ) -> Dict[str, Dict[str, int]]:
+        filtered_counts: Dict[str, Dict[str, int]] = {}
+        for extension, counts in (extension_counts or {}).items():
+            filtered_value = counts.get("filtered_out")
+            if filtered_value:
+                filtered_counts[extension] = {"filtered_out": filtered_value}
+        return filtered_counts
+
+    @staticmethod
+    def _derive_sync_status(file_states: List[GitSyncFileState]) -> str:
+        active_states = [state for state in file_states if state.active]
+        if any(state.last_status in {"queued", "processing"} for state in active_states):
+            return "processing"
+        if any(state.last_status == "failed" for state in active_states):
+            return "completed_with_errors"
+        if active_states:
+            return "completed"
+        return "idle"
+
+    @staticmethod
+    def _derive_sync_error(file_states: List[GitSyncFileState]) -> Optional[str]:
+        for state in file_states:
+            if state.active and state.last_status == "failed" and state.last_error:
+                return state.last_error
+        return None
+
+    @staticmethod
     def to_response(sync: GitSync) -> GitSyncResponse:
+        summary = sync.last_run_summary
+        if summary is None and sync.file_states:
+            summary = GitSyncRunSummary()
+            GitSyncService._refresh_summary_metrics(summary, sync.file_states)
         return GitSyncResponse(
             id=sync.id or "",
             provider=sync.provider,
@@ -833,6 +1254,8 @@ class GitSyncService:
             max_discovery_depth=sync.max_discovery_depth,
             max_discovery_files=sync.max_discovery_files,
             confirmed_paths=sync.confirmed_paths,
+            include_extensions=sync.include_extensions,
+            exclude_extensions=sync.exclude_extensions,
             credential_id=sync.credential_id,
             notebooks=sync.notebooks,
             transformations=sync.transformations,
@@ -841,8 +1264,8 @@ class GitSyncService:
             last_sync=sync.last_sync.isoformat() if sync.last_sync else None,
             last_status=sync.last_status,
             last_error=sync.last_error,
-            last_run_summary=GitSyncService._summary_to_response(sync.last_run_summary)
-            if sync.last_run_summary
+            last_run_summary=GitSyncService._summary_to_response(summary)
+            if summary
             else None,
             file_states=[
                 GitSyncService._file_state_to_response(state)
@@ -862,6 +1285,9 @@ class GitSyncService:
             repaired=summary.repaired,
             skipped=summary.skipped,
             failed=summary.failed,
+            filtered_out=summary.filtered_out,
+            status_counts=summary.status_counts,
+            extension_counts=summary.extension_counts,
             started_at=summary.started_at.isoformat() if summary.started_at else None,
             completed_at=summary.completed_at.isoformat() if summary.completed_at else None,
         )
@@ -875,6 +1301,10 @@ class GitSyncService:
             raw_url=state.raw_url,
             source_id=state.source_id,
             content_hash=state.content_hash,
+            command_id=state.command_id,
+            command_updated_at=(
+                state.command_updated_at.isoformat() if state.command_updated_at else None
+            ),
             last_sync=state.last_sync.isoformat() if state.last_sync else None,
             last_status=state.last_status,
             last_error=state.last_error,

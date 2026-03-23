@@ -1,7 +1,8 @@
 from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from loguru import logger
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from open_notebook.domain.base import ObjectModel
 
@@ -11,6 +12,8 @@ class GitSyncFileState(BaseModel):
     raw_url: Optional[str] = None
     source_id: Optional[str] = None
     content_hash: Optional[str] = None
+    command_id: Optional[str] = None
+    command_updated_at: Optional[datetime] = None
     last_sync: Optional[datetime] = None
     last_status: Optional[str] = None
     last_error: Optional[str] = None
@@ -24,6 +27,14 @@ class GitSyncFileState(BaseModel):
             raise ValueError("Path cannot be empty")
         return cleaned
 
+    @field_validator("command_id", mode="before")
+    @classmethod
+    def normalize_command_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
 
 class GitSyncRunSummary(BaseModel):
     created: int = 0
@@ -31,6 +42,9 @@ class GitSyncRunSummary(BaseModel):
     repaired: int = 0
     skipped: int = 0
     failed: int = 0
+    filtered_out: int = 0
+    status_counts: Dict[str, int] = Field(default_factory=dict)
+    extension_counts: Dict[str, Dict[str, int]] = Field(default_factory=dict)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
@@ -54,6 +68,8 @@ class GitSync(ObjectModel):
     max_discovery_depth: int = 2
     max_discovery_files: int = 200
     confirmed_paths: List[str] = Field(default_factory=list)
+    include_extensions: List[str] = Field(default_factory=list)
+    exclude_extensions: List[str] = Field(default_factory=list)
     credential_id: Optional[str] = None
     notebooks: List[str] = Field(default_factory=list)
     transformations: List[str] = Field(default_factory=list)
@@ -81,7 +97,12 @@ class GitSync(ObjectModel):
         cleaned = value.strip()
         return cleaned or None
 
-    @field_validator("paths", "seed_paths", "confirmed_paths", mode="before")
+    @field_validator(
+        "paths",
+        "seed_paths",
+        "confirmed_paths",
+        mode="before",
+    )
     @classmethod
     def normalize_paths(cls, value: List[str]) -> List[str]:
         normalized = []
@@ -91,6 +112,21 @@ class GitSync(ObjectModel):
                 raise ValueError("Paths cannot contain empty values")
             normalized.append(cleaned)
         return normalized
+
+    @field_validator("include_extensions", "exclude_extensions", mode="before")
+    @classmethod
+    def normalize_extensions(cls, value: Optional[List[str]]) -> List[str]:
+        normalized: List[str] = []
+        for item in value or []:
+            if not isinstance(item, str):
+                raise ValueError("Each extension must be a string")
+            cleaned = item.strip().lower()
+            if not cleaned:
+                raise ValueError("Extensions cannot contain empty values")
+            if not cleaned.startswith("."):
+                cleaned = f".{cleaned}"
+            normalized.append(cleaned)
+        return list(dict.fromkeys(normalized))
 
     @field_validator("max_discovery_depth", mode="before")
     @classmethod
@@ -112,11 +148,26 @@ class GitSync(ObjectModel):
         cls, value: Optional[List[GitSyncFileState | Dict[str, Any]]]
     ) -> List[GitSyncFileState]:
         normalized: List[GitSyncFileState] = []
-        for item in value or []:
+        if value is None:
+            return normalized
+        if not isinstance(value, list):
+            logger.warning(
+                "Ignoring invalid git sync file_states payload with unexpected type: {}",
+                type(value).__name__,
+            )
+            return normalized
+        for item in value:
             if isinstance(item, GitSyncFileState):
                 normalized.append(item)
             else:
-                normalized.append(GitSyncFileState(**item))
+                try:
+                    normalized.append(GitSyncFileState(**item))
+                except (TypeError, ValidationError) as exc:
+                    logger.warning(
+                        "Ignoring invalid git sync file state payload: {} ({})",
+                        item,
+                        exc,
+                    )
         return normalized
 
     @field_validator("last_run_summary", mode="before")
@@ -183,6 +234,5 @@ class GitSync(ObjectModel):
         data = super()._prepare_save_data()
         if self.last_run_summary is not None:
             data["last_run_summary"] = self.last_run_summary.model_dump()
-        if self.file_states:
-            data["file_states"] = [state.model_dump() for state in self.file_states]
+        data["file_states"] = [state.model_dump() for state in self.file_states]
         return data

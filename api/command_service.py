@@ -1,16 +1,105 @@
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
-from surreal_commands import get_command_status, submit_command
+from surreal_commands import submit_command
 
 from open_notebook.database.repository import ensure_record_id, repo_query, repo_update
 from open_notebook.exceptions import InvalidInputError, NotFoundError
 
 
 SOURCE_QUEUE_FETCH_LIMIT_CAP = 500
+ACTIVE_COMMAND_STATUSES = {"new", "queued", "running"}
+COMMAND_STALE_AFTER = timedelta(minutes=15)
+
 
 class CommandService:
     """Generic service layer for command operations"""
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _build_status_payload(command: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "job_id": str(command.get("id")),
+            "status": command.get("status", "unknown"),
+            "result": command.get("result"),
+            "error_message": command.get("error_message"),
+            "created": str(command.get("created")) if command.get("created") else None,
+            "updated": str(command.get("updated")) if command.get("updated") else None,
+            "progress": command.get("progress"),
+        }
+
+    @staticmethod
+    async def _mark_command_failed(job_id: str, error_message: str) -> Dict[str, Any]:
+        await repo_update(
+            "command",
+            job_id,
+            {
+                "status": "failed",
+                "error_message": error_message,
+            },
+        )
+        refreshed = await repo_query("SELECT * FROM $id", {"id": ensure_record_id(job_id)})
+        if not refreshed:
+            return {
+                "id": job_id,
+                "status": "failed",
+                "error_message": error_message,
+                "result": None,
+                "created": None,
+                "updated": datetime.now(timezone.utc).isoformat(),
+                "progress": None,
+            }
+        return refreshed[0]
+
+    @staticmethod
+    async def _reconcile_command_record(command: Dict[str, Any]) -> Dict[str, Any]:
+        job_id = str(command.get("id"))
+        status = command.get("status", "unknown")
+        result = command.get("result")
+        error_message = command.get("error_message")
+
+        if status == "completed" and isinstance(result, dict) and result.get("success") is False:
+            derived_error = (
+                result.get("error_message")
+                or error_message
+                or "Command completed with success=false"
+            )
+            logger.warning(
+                "Marking command {} as failed because result.success=false: {}",
+                job_id,
+                derived_error,
+            )
+            return await CommandService._mark_command_failed(job_id, str(derived_error))
+
+        if status in ACTIVE_COMMAND_STATUSES:
+            updated_at = CommandService._parse_datetime(command.get("updated"))
+            created_at = CommandService._parse_datetime(command.get("created"))
+            reference_time = updated_at or created_at
+            if reference_time and datetime.now(timezone.utc) - reference_time > COMMAND_STALE_AFTER:
+                timeout_minutes = int(COMMAND_STALE_AFTER.total_seconds() // 60)
+                timeout_message = (
+                    f"Command exceeded {timeout_minutes} minutes without status change "
+                    "and was marked as failed"
+                )
+                logger.warning("Marking stale command {} as failed: {}", job_id, timeout_message)
+                return await CommandService._mark_command_failed(job_id, timeout_message)
+
+        return command
 
     @staticmethod
     async def submit_command_job(
@@ -52,22 +141,11 @@ class CommandService:
     async def get_command_status(job_id: str) -> Dict[str, Any]:
         """Get status of any command job"""
         try:
-            status = await get_command_status(job_id)
-            return {
-                "job_id": job_id,
-                "status": status.status if status else "unknown",
-                "result": status.result if status else None,
-                "error_message": getattr(status, "error_message", None)
-                if status
-                else None,
-                "created": str(status.created)
-                if status and hasattr(status, "created") and status.created
-                else None,
-                "updated": str(status.updated)
-                if status and hasattr(status, "updated") and status.updated
-                else None,
-                "progress": getattr(status, "progress", None) if status else None,
-            }
+            result = await repo_query("SELECT * FROM $id", {"id": ensure_record_id(job_id)})
+            if not result:
+                raise NotFoundError(f"Command job {job_id} not found")
+            command = await CommandService._reconcile_command_record(result[0])
+            return CommandService._build_status_payload(command)
         except Exception as e:
             logger.error(f"Failed to get command status: {e}")
             raise
@@ -108,16 +186,17 @@ class CommandService:
 
             jobs: List[Dict[str, Any]] = []
             for command in commands:
+                job_id = str(command.get("id"))
+                source = source_map.get(job_id)
+                if source_only and source is None:
+                    continue
+
+                command = await CommandService._reconcile_command_record(command)
                 if module_filter and command.get("app") != module_filter:
                     continue
                 if command_filter and command.get("name") != command_filter:
                     continue
                 if status_filter and command.get("status") != status_filter:
-                    continue
-
-                job_id = str(command.get("id"))
-                source = source_map.get(job_id)
-                if source_only and source is None:
                     continue
 
                 asset = source.get("asset") if source else None

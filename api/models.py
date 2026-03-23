@@ -693,6 +693,8 @@ class GitSyncFileStateResponse(BaseModel):
     raw_url: Optional[str] = None
     source_id: Optional[str] = None
     content_hash: Optional[str] = None
+    command_id: Optional[str] = None
+    command_updated_at: Optional[str] = None
     last_sync: Optional[str] = None
     last_status: Optional[str] = None
     last_error: Optional[str] = None
@@ -705,6 +707,9 @@ class GitSyncRunSummaryResponse(BaseModel):
     repaired: int = 0
     skipped: int = 0
     failed: int = 0
+    filtered_out: int = 0
+    status_counts: Dict[str, int] = Field(default_factory=dict)
+    extension_counts: Dict[str, Dict[str, int]] = Field(default_factory=dict)
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
 
@@ -777,6 +782,14 @@ class GitSyncCreateRequest(BaseModel):
         default_factory=list,
         description="User-approved repository file paths to process",
     )
+    include_extensions: List[str] = Field(
+        default_factory=list,
+        description="Only import files with these extensions",
+    )
+    exclude_extensions: List[str] = Field(
+        default_factory=list,
+        description="Skip files with these extensions even if otherwise selected",
+    )
     credential_id: Optional[str] = Field(
         None, description="Credential ID with PAT access"
     )
@@ -799,7 +812,12 @@ class GitSyncCreateRequest(BaseModel):
         value = v.strip()
         return value or None
 
-    @field_validator("paths", "seed_paths", "confirmed_paths", mode="before")
+    @field_validator(
+        "paths",
+        "seed_paths",
+        "confirmed_paths",
+        mode="before",
+    )
     @classmethod
     def normalize_paths(cls, v):
         if v is None:
@@ -815,6 +833,23 @@ class GitSyncCreateRequest(BaseModel):
         if not normalized:
             return []
         return normalized
+
+    @field_validator("include_extensions", "exclude_extensions", mode="before")
+    @classmethod
+    def normalize_extensions(cls, v):
+        if v is None:
+            return []
+        normalized = []
+        for item in v:
+            if not isinstance(item, str):
+                raise ValueError("Each extension must be a string")
+            cleaned = item.strip().lower()
+            if not cleaned:
+                raise ValueError("Extensions cannot contain empty values")
+            if not cleaned.startswith("."):
+                cleaned = f".{cleaned}"
+            normalized.append(cleaned)
+        return list(dict.fromkeys(normalized))
 
     @model_validator(mode="after")
     def validate_provider_specific_fields(self):
@@ -847,6 +882,12 @@ class GitSyncUpdateRequest(BaseModel):
     confirmed_paths: Optional[List[str]] = Field(
         None, description="User-approved repository file paths to process"
     )
+    include_extensions: Optional[List[str]] = Field(
+        None, description="Only import files with these extensions"
+    )
+    exclude_extensions: Optional[List[str]] = Field(
+        None, description="Skip files with these extensions even if otherwise selected"
+    )
     credential_id: Optional[str] = Field(
         None, description="Credential ID with PAT access"
     )
@@ -869,7 +910,12 @@ class GitSyncUpdateRequest(BaseModel):
         value = v.strip()
         return value or None
 
-    @field_validator("paths", "seed_paths", "confirmed_paths", mode="before")
+    @field_validator(
+        "paths",
+        "seed_paths",
+        "confirmed_paths",
+        mode="before",
+    )
     @classmethod
     def normalize_update_paths(cls, v):
         if v is None:
@@ -884,6 +930,23 @@ class GitSyncUpdateRequest(BaseModel):
             normalized.append(cleaned)
         return normalized
 
+    @field_validator("include_extensions", "exclude_extensions", mode="before")
+    @classmethod
+    def normalize_update_extensions(cls, v):
+        if v is None:
+            return None
+        normalized = []
+        for item in v:
+            if not isinstance(item, str):
+                raise ValueError("Each extension must be a string")
+            cleaned = item.strip().lower()
+            if not cleaned:
+                raise ValueError("Extensions cannot contain empty values")
+            if not cleaned.startswith("."):
+                cleaned = f".{cleaned}"
+            normalized.append(cleaned)
+        return list(dict.fromkeys(normalized))
+
 
 class GitSyncResponse(BaseModel):
     id: str
@@ -895,6 +958,8 @@ class GitSyncResponse(BaseModel):
     max_discovery_depth: int
     max_discovery_files: int
     confirmed_paths: List[str]
+    include_extensions: List[str]
+    exclude_extensions: List[str]
     credential_id: Optional[str] = None
     notebooks: List[str]
     transformations: List[str]

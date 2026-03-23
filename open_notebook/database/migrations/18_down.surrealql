@@ -1,0 +1,2 @@
+REMOVE FIELD include_extensions ON git_sync;
+REMOVE FIELD exclude_extensions ON git_sync;

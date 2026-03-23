@@ -144,6 +144,46 @@ class TestTransformationGraph:
         with pytest.raises(AssertionError, match="No content to transform"):
             await run_transformation(state, config)
 
+    @pytest.mark.asyncio
+    async def test_run_transformation_times_out(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from open_notebook.domain.notebook import Source
+        from open_notebook.domain.transformation import Transformation
+        from open_notebook.exceptions import TimeoutExceededError
+
+        mock_source = MagicMock(spec=Source)
+        mock_source.id = "source:1"
+        mock_source.add_insight = AsyncMock(return_value=None)
+
+        mock_transformation = MagicMock(spec=Transformation)
+        mock_transformation.id = "transformation:1"
+        mock_transformation.title = "Dense Summary"
+        mock_transformation.prompt = "Summarize"
+
+        mock_chain = MagicMock()
+        mock_chain.ainvoke = AsyncMock()
+
+        async def raise_timeout(*args, **kwargs):
+            raise TimeoutError()
+
+        state = {
+            "input_text": "Test text",
+            "transformation": mock_transformation,
+            "source": mock_source,
+        }
+        config = {"configurable": {"model_id": None}}
+
+        with patch(
+            "open_notebook.graphs.transformation.provision_langchain_model",
+            new=AsyncMock(return_value=mock_chain),
+        ), patch(
+            "open_notebook.graphs.transformation.asyncio.wait_for",
+            new=AsyncMock(side_effect=raise_timeout),
+        ):
+            with pytest.raises(TimeoutExceededError, match="timed out"):
+                await run_transformation(state, config)
+
     def test_transformation_graph_compilation(self):
         """Test that transformation graph compiles correctly."""
         assert transformation_graph is not None

@@ -5,6 +5,8 @@ export interface GitSyncFileState {
   raw_url?: string | null
   source_id?: string | null
   content_hash?: string | null
+  command_id?: string | null
+  command_updated_at?: string | null
   last_sync?: string | null
   last_status?: string | null
   last_error?: string | null
@@ -29,6 +31,9 @@ export interface GitSyncRunSummary {
   repaired: number
   skipped: number
   failed: number
+  filtered_out: number
+  status_counts: Record<string, number>
+  extension_counts: Record<string, Record<string, number>>
   started_at?: string | null
   completed_at?: string | null
 }
@@ -43,6 +48,8 @@ export interface GitSyncResponse {
   max_discovery_depth: number
   max_discovery_files: number
   confirmed_paths: string[]
+  include_extensions: string[]
+  exclude_extensions: string[]
   credential_id?: string | null
   notebooks: string[]
   transformations: string[]
@@ -66,6 +73,8 @@ export interface CreateGitSyncRequest {
   max_discovery_depth?: number
   max_discovery_files?: number
   confirmed_paths?: string[]
+  include_extensions?: string[]
+  exclude_extensions?: string[]
   credential_id?: string
   notebooks: string[]
   transformations: string[]

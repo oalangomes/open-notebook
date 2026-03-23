@@ -1,14 +1,10 @@
-# Docker Compose - Connect to Local Ollama
-#
-# This setup expects Ollama to be running locally on your machine.
-# It only manages SurrealDB and Open Notebook containers.
+# Docker Compose without Ollama
+# Use this for cloud AI providers (OpenAI, Anthropic, Google, etc)
 #
 # Usage:
-#   1. Start Ollama locally: ollama serve
-#   2. Change OPEN_NOTEBOOK_ENCRYPTION_KEY below
-#   3. Run: docker compose up -d
-#   4. Access frontend: http://localhost:3000
-#   5. Configure in UI: Settings → API Keys → Add Ollama (URL: http://host.docker.internal:11434)
+#   1. Configure API keys: export OPENAI_API_KEY=... (or other provider)
+#   2. Run: docker compose -f docker-compose.no-ollama.yml up -d
+#   3. Access: http://localhost:3000 (frontend) and http://localhost:5055 (API)
 
 services:
   surrealdb:
@@ -30,7 +26,6 @@ services:
       dockerfile: Dockerfile
     image: open-notebook-local:dev
     ports:
-      - "8502:8502"
       - "5055:5055"
     environment:
       # REQUIRED: Change this to your own secret string
@@ -43,13 +38,15 @@ services:
       - SURREAL_NAMESPACE=open_notebook
       - SURREAL_DATABASE=open_notebook
 
-      # Ollama connection (local, outside Docker)
-      - OLLAMA_HOST=http://host.docker.internal:11434
+      # AI Provider configuration (configure via Settings UI or env vars)
+      # Example: OpenAI
+      # - OPENAI_API_KEY=sk-...
+      # Example: Anthropic
+      # - ANTHROPIC_API_KEY=sk-ant-...
+
     volumes:
       - ./notebook_data:/app/data
     depends_on:
       - surrealdb
     restart: always
     pull_policy: always
-
-

@@ -16,6 +16,8 @@ interface GitSourcePreviewStepProps {
   items: GitSourcePreviewItem[]
   selectedPaths: string[]
   warnings?: string[]
+  includeExtensions?: string[]
+  excludeExtensions?: string[]
   isPortuguese?: boolean
   onTogglePath: (path: string) => void
   onSelectAll: () => void
@@ -36,6 +38,8 @@ export function GitSourcePreviewStep({
   items,
   selectedPaths,
   warnings = [],
+  includeExtensions = [],
+  excludeExtensions = [],
   isPortuguese = false,
   onTogglePath,
   onSelectAll,
@@ -68,6 +72,28 @@ export function GitSourcePreviewStep({
           </Button>
         </div>
       </div>
+
+      {(includeExtensions.length > 0 || excludeExtensions.length > 0) && (
+        <div className="rounded-lg border border-primary/20 bg-primary/5 p-3 text-sm">
+          <p className="font-medium">
+            {isPortuguese ? 'Filtros de formato aplicados' : 'Applied format filters'}
+          </p>
+          {includeExtensions.length > 0 && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              {isPortuguese
+                ? `Importando apenas: ${includeExtensions.join(', ')}`
+                : `Only importing: ${includeExtensions.join(', ')}`}
+            </p>
+          )}
+          {excludeExtensions.length > 0 && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              {isPortuguese
+                ? `Ignorando: ${excludeExtensions.join(', ')}`
+                : `Ignoring: ${excludeExtensions.join(', ')}`}
+            </p>
+          )}
+        </div>
+      )}
 
       {warnings.length > 0 && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">

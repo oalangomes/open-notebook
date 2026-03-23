@@ -42,6 +42,16 @@ _CLASSIFICATION_RULES: list[tuple[list[str], type[OpenNotebookError], str | None
         ConfigurationError,
         None,
     ),
+    (
+        [
+            "does not support chat",
+            "not a languagemodel",
+            "language model",
+            "embedding model in chat",
+        ],
+        ConfigurationError,
+        "A chat/transformation model is misconfigured. Please review Settings -> Models.",
+    ),
     # Network errors
     (
         ["connecterror", "timeoutexception", "connection refused", "connection error", "timed out", "timeout"],

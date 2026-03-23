@@ -64,6 +64,12 @@ class NetworkError(OpenNotebookError):
     pass
 
 
+class TimeoutExceededError(OpenNotebookError):
+    """Raised when an operation exceeds the configured timeout."""
+
+    pass
+
+
 class NoTranscriptFound(OpenNotebookError):
     """Raised when no transcript is found for a video."""
 

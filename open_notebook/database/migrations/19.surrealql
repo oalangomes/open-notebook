@@ -1,0 +1,21 @@
+DEFINE FIELD file_states.*.path ON git_sync TYPE string;
+DEFINE FIELD file_states.*.raw_url ON git_sync TYPE option<string>;
+DEFINE FIELD file_states.*.source_id ON git_sync TYPE option<string>;
+DEFINE FIELD file_states.*.content_hash ON git_sync TYPE option<string>;
+DEFINE FIELD file_states.*.command_id ON git_sync TYPE option<string>;
+DEFINE FIELD file_states.*.command_updated_at ON git_sync TYPE option<datetime>;
+DEFINE FIELD file_states.*.last_sync ON git_sync TYPE option<datetime>;
+DEFINE FIELD file_states.*.last_status ON git_sync TYPE option<string>;
+DEFINE FIELD file_states.*.last_error ON git_sync TYPE option<string>;
+DEFINE FIELD file_states.*.active ON git_sync TYPE bool DEFAULT true;
+
+DEFINE FIELD last_run_summary.created ON git_sync TYPE int DEFAULT 0;
+DEFINE FIELD last_run_summary.updated ON git_sync TYPE int DEFAULT 0;
+DEFINE FIELD last_run_summary.repaired ON git_sync TYPE int DEFAULT 0;
+DEFINE FIELD last_run_summary.skipped ON git_sync TYPE int DEFAULT 0;
+DEFINE FIELD last_run_summary.failed ON git_sync TYPE int DEFAULT 0;
+DEFINE FIELD last_run_summary.filtered_out ON git_sync TYPE int DEFAULT 0;
+DEFINE FIELD last_run_summary.status_counts ON git_sync FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD last_run_summary.extension_counts ON git_sync FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD last_run_summary.started_at ON git_sync TYPE option<datetime>;
+DEFINE FIELD last_run_summary.completed_at ON git_sync TYPE option<datetime>;

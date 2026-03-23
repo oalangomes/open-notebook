@@ -1,14 +1,16 @@
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
 from pydantic import SecretStr
 
+from api.command_service import CommandService
 from api.git_raw_client import GitRawClient, GitRawNotFoundError, RawFetchResult
-from api.git_sync_service import GitSyncService
+from api.git_sync_service import GitDiscoveredPath, GitSyncService
 from api.models import GitSyncCreateRequest
 from open_notebook.domain.credential import Credential
-from open_notebook.domain.git_sync import GitSync, GitSyncFileState
+from open_notebook.domain.git_sync import GitSync, GitSyncFileState, GitSyncRunSummary
 from open_notebook.domain.notebook import Asset, Source
 
 
@@ -124,6 +126,19 @@ class TestGitSyncModels:
                 branch="main",
                 paths=["docs/a.md"],
             )
+
+    def test_git_sync_create_request_normalizes_extension_filters(self):
+        request = GitSyncCreateRequest(
+            provider="github",
+            repo="owner/repo",
+            branch="main",
+            paths=["docs/a.md"],
+            include_extensions=[" md ", ".PUML"],
+            exclude_extensions=["svg"],
+        )
+
+        assert request.include_extensions == [".md", ".puml"]
+        assert request.exclude_extensions == [".svg"]
 
     def test_git_sync_domain_allows_missing_credential_id_for_public_github(self):
         sync = GitSync(
@@ -301,6 +316,53 @@ class TestGitSyncService:
         assert response.items[2].discovered_from == "README.md"
         assert response.items[2].file_type == "puml"
         assert response.items[3].file_type == "svg"
+
+    @pytest.mark.asyncio
+    async def test_preview_sync_filters_extensions(self):
+        request = GitSyncCreateRequest(
+            provider="github",
+            repo="owner/repo",
+            branch="main",
+            seed_paths=["README.md"],
+            include_extensions=["md", ".puml"],
+            exclude_extensions=[".svg"],
+        )
+
+        with patch.object(
+            GitSyncService,
+            "_validate_discovery_config",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            GitSyncService,
+            "_get_valid_credential",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            GitSyncService,
+            "_build_client",
+            return_value=AsyncMock(),
+        ), patch.object(
+            GitSyncService,
+            "_discover_paths",
+            new=AsyncMock(
+                return_value=(
+                    [
+                        GitDiscoveredPath(path="README.md", source_type="seed"),
+                        GitDiscoveredPath(path="docs/guide.md", source_type="discovered"),
+                        GitDiscoveredPath(path="docs/diagram.puml", source_type="discovered"),
+                        GitDiscoveredPath(path="docs/architecture.svg", source_type="discovered"),
+                    ],
+                    [],
+                )
+            ),
+        ):
+            response = await GitSyncService.preview_sync(request)
+
+        assert [item.path for item in response.items] == [
+            "README.md",
+            "docs/guide.md",
+            "docs/diagram.puml",
+        ]
+        assert response.warnings == ["Filtered out 1 file(s) by extension rules"]
 
     @pytest.mark.asyncio
     async def test_resolve_source_uses_repo_path_as_title(self):
@@ -708,7 +770,7 @@ class TestGitSyncService:
             GitSyncService,
             "_submit_source_processing",
             new=AsyncMock(return_value="command:1"),
-        ):
+        ) as submit_processing:
             response = await GitSyncService.run_sync("git_sync:3")
 
         assert response.summary.created == 4
@@ -719,3 +781,249 @@ class TestGitSyncService:
             "docs/flow.puml",
             "assets/architecture.svg",
         ]
+        assert submit_processing.await_count == 1
+        states = {state.path: state for state in response.file_states}
+        assert states["README.md"].command_id == "command:1"
+        assert states["docs/guide.md"].command_id is None
+        assert states["docs/flow.puml"].command_id is None
+        assert states["assets/architecture.svg"].command_id is None
+
+    @pytest.mark.asyncio
+    async def test_run_sync_applies_extension_filters_and_summary_counts(self):
+        sync = GitSync(
+            id="git_sync:filters",
+            provider="github",
+            repo="owner/repo",
+            branch="main",
+            confirmed_paths=["docs/guide.md", "docs/diagram.puml", "docs/architecture.svg"],
+            include_extensions=[".md", ".puml"],
+            exclude_extensions=[".svg"],
+            credential_id=None,
+            notebooks=[],
+            transformations=[],
+            embed=False,
+        )
+
+        client = AsyncMock()
+        client.fetch_text_file = AsyncMock(
+            side_effect=[
+                RawFetchResult(
+                    raw_url="https://raw/guide",
+                    content="# Guide",
+                    content_hash="hash-guide",
+                ),
+                RawFetchResult(
+                    raw_url="https://raw/diagram",
+                    content="@startuml\nAlice -> Bob\n@enduml",
+                    content_hash="hash-puml",
+                ),
+            ]
+        )
+
+        def resolve_source(sync_obj, state):
+            return (Source(id=f"source:{state.path}", title=state.path), True)
+
+        with patch.object(GitSync, "get", new=AsyncMock(return_value=sync)), patch.object(
+            GitSync, "save", new=AsyncMock(return_value=None)
+        ), patch.object(
+            GitSyncService,
+            "_get_valid_credential",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            GitSyncService, "_build_client", return_value=client
+        ), patch.object(
+            GitSyncService,
+            "_resolve_source",
+            new=AsyncMock(side_effect=resolve_source),
+        ), patch.object(
+            GitSyncService,
+            "_ensure_source_notebooks",
+            new=AsyncMock(return_value=None),
+        ), patch.object(
+            GitSyncService,
+            "_submit_source_processing",
+            new=AsyncMock(return_value="command:1"),
+        ) as submit_processing:
+            response = await GitSyncService.run_sync("git_sync:filters")
+
+        assert [state.path for state in response.file_states if state.active] == [
+            "docs/guide.md",
+            "docs/diagram.puml",
+        ]
+        assert response.summary.filtered_out == 1
+        assert response.summary.status_counts["queued"] == 2
+        assert response.summary.status_counts["filtered_out"] == 1
+        assert response.summary.extension_counts[".svg"]["filtered_out"] == 1
+        assert submit_processing.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_reconcile_sync_state_updates_file_status_from_command_results(self):
+        sync = GitSync(
+            id="git_sync:reconcile",
+            provider="github",
+            repo="owner/repo",
+            branch="main",
+            paths=["docs/guide.md", "docs/broken.md"],
+            file_states=[
+                GitSyncFileState(
+                    path="docs/guide.md",
+                    command_id="command:ok",
+                    last_status="queued",
+                    active=True,
+                ),
+                GitSyncFileState(
+                    path="docs/broken.md",
+                    command_id="command:broken",
+                    last_status="processing",
+                    active=True,
+                ),
+            ],
+            last_run_summary=GitSyncRunSummary(),
+        )
+
+        with patch.object(
+            CommandService,
+            "get_command_status",
+            new=AsyncMock(
+                side_effect=[
+                    {
+                        "job_id": "command:ok",
+                        "status": "completed",
+                        "result": {"success": True},
+                        "error_message": None,
+                        "updated": "2026-03-18T16:10:00+00:00",
+                    },
+                    {
+                        "job_id": "command:broken",
+                        "status": "completed",
+                        "result": {
+                            "success": False,
+                            "error_message": "Model does not support chat",
+                        },
+                        "error_message": None,
+                        "updated": "2026-03-18T16:11:00+00:00",
+                    },
+                ]
+            ),
+        ), patch.object(GitSync, "save", new=AsyncMock(return_value=None)):
+            await GitSyncService._reconcile_sync_state(sync)
+
+        states = {state.path: state for state in sync.file_states}
+        assert states["docs/guide.md"].last_status == "completed"
+        assert states["docs/broken.md"].last_status == "failed"
+        assert states["docs/broken.md"].last_error == "Model does not support chat"
+        assert sync.last_status == "completed_with_errors"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_sync_state_dispatches_next_queued_file_after_completion(self):
+        sync = GitSync(
+            id="git_sync:serial",
+            provider="github",
+            repo="owner/repo",
+            branch="main",
+            paths=["docs/guide.md", "docs/next.md"],
+            file_states=[
+                GitSyncFileState(
+                    path="docs/guide.md",
+                    source_id="source:guide",
+                    command_id="command:first",
+                    last_status="processing",
+                    active=True,
+                ),
+                GitSyncFileState(
+                    path="docs/next.md",
+                    source_id="source:next",
+                    last_status="queued",
+                    active=True,
+                ),
+            ],
+            last_run_summary=GitSyncRunSummary(),
+        )
+        next_source = Source(
+            id="source:next",
+            title="docs/next.md",
+            full_text="# Next",
+            asset=Asset(url="https://raw/next", file_path="docs/next.md"),
+        )
+
+        with patch.object(
+            CommandService,
+            "get_command_status",
+            new=AsyncMock(
+                return_value={
+                    "job_id": "command:first",
+                    "status": "completed",
+                    "result": {"success": True},
+                    "error_message": None,
+                    "updated": "2026-03-18T16:10:00+00:00",
+                }
+            ),
+        ), patch(
+            "api.git_sync_service.Source.get",
+            new=AsyncMock(return_value=next_source),
+        ), patch.object(
+            GitSyncService,
+            "_submit_source_processing",
+            new=AsyncMock(return_value="command:next"),
+        ) as submit_processing, patch.object(
+            GitSync, "save", new=AsyncMock(return_value=None)
+        ):
+            await GitSyncService._reconcile_sync_state(sync)
+
+        states = {state.path: state for state in sync.file_states}
+        assert states["docs/guide.md"].last_status == "completed"
+        assert states["docs/next.md"].command_id == "command:next"
+        assert states["docs/next.md"].last_status == "queued"
+        assert submit_processing.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_reconcile_sync_state_does_not_dispatch_when_another_file_is_inflight(self):
+        sync = GitSync(
+            id="git_sync:serial-busy",
+            provider="github",
+            repo="owner/repo",
+            branch="main",
+            paths=["docs/guide.md", "docs/next.md"],
+            file_states=[
+                GitSyncFileState(
+                    path="docs/guide.md",
+                    source_id="source:guide",
+                    command_id="command:first",
+                    last_status="queued",
+                    active=True,
+                ),
+                GitSyncFileState(
+                    path="docs/next.md",
+                    source_id="source:next",
+                    last_status="queued",
+                    active=True,
+                ),
+            ],
+            last_run_summary=GitSyncRunSummary(),
+        )
+
+        with patch.object(
+            CommandService,
+            "get_command_status",
+            new=AsyncMock(
+                return_value={
+                    "job_id": "command:first",
+                    "status": "queued",
+                    "result": None,
+                    "error_message": None,
+                    "updated": "2026-03-18T16:10:00+00:00",
+                }
+            ),
+        ), patch.object(
+            GitSyncService,
+            "_submit_source_processing",
+            new=AsyncMock(return_value="command:next"),
+        ) as submit_processing, patch.object(
+            GitSync, "save", new=AsyncMock(return_value=None)
+        ):
+            await GitSyncService._reconcile_sync_state(sync)
+
+        states = {state.path: state for state in sync.file_states}
+        assert states["docs/guide.md"].command_id == "command:first"
+        assert states["docs/next.md"].command_id is None
+        assert submit_processing.await_count == 0
